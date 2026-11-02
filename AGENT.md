@@ -150,9 +150,14 @@ python/
   `TableManager` + `page_table` + `MHAPool` + `CacheManager`，届时引入
   `table_idx`/`token_pool`/`out_loc`，prefill 预算与 `ChunkedReq`。
   RadixCache（prefix caching）作为可选项最后做。
-  已提前落地：`python/kvcache/req_to_token_pool.py`（ReqToTokenPool，
-  对齐 sglang memory_pool.py——`[max_running_req, max_context_len]`
-  表 + free list 栈分配，即未来 TableManager 的 token_pool 底座）。
+  已提前落地：
+  - `python/kvcache/req_to_token_pool.py`（ReqToTokenPool，对齐 sglang
+    memory_pool.py——`[max_running_req, max_context_len]` 表 + free list
+    栈分配，即未来 TableManager 的 token_pool 底座）；
+  - `python/kvcache/allocator.py`（TokenToKVPoolAllocator，合并 sglang
+    的 token/paged 两个 allocator：free_pages + staged_pages[need_sort]
+    free list，alloc/alloc_extend/alloc_decode 与 free/free_page_ids/
+    free_segment(s) 接口，单请求标量 API 代替 batched Triton kernel）。
 - **R5 采样完整化**：temperature / top_k / top_p（`BatchSamplingArgs`），
   种子处理。
 - **R6（可选）** attention backend 抽象与全局 `Context`：只有当
