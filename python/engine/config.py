@@ -15,3 +15,5 @@ class EngineConfig:
     model_path: str
     # golden test 以对齐 HF fp32 为准；权重是 BF16，copy_ 加载时自动升精度。
     dtype: torch.dtype = torch.bfloat16
+    # 同时在跑的最大请求数（R3 起是唯一准入约束；KV cache 引入后另有显存约束）。
+    max_running_req: int = 256

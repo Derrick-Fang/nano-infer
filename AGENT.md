@@ -138,11 +138,14 @@ python/
   `is_greedy`）；`llm.py` 的 `LLM.generate()` 走"全体 prefill → 逐步
   decode"最短路径。**golden test 已通过：混合 batch 的 greedy 输出
   逐 token 对齐 HF `generate()`（`tests/test_greedy_decode.py`）。**
-- **R3 Scheduler + 连续批处理**：`PrefillManager` / `DecodeManager` /
-  `PendingReq` / `Scheduler.normal_loop`（同步：schedule → forward →
-  process，无 overlap）。准入先只受 `max_running_req` 限制（无内存约束，
-  因为还没有 KV cache）。测试：多 prompt 混合 batch，各自输出仍逐 token
-  对齐 HF。
+- **R3 Scheduler + 连续批处理（已完成）**：`PrefillManager` /
+  `PrefillAdder` / `DecodeManager` / `PendingReq` / `Scheduler.normal_loop`
+  （同步：schedule → forward → process，无 overlap）；`LLM` 改为继承
+  `Scheduler`。准入只受 `max_running_req` 限制（无内存约束，因为还没
+  有 KV cache）；token 预算（`max_extend_tokens`）已保留但 R3 无
+  `ChunkedReq`，单条超预算的 prompt 整批放行。测试：名额受限多波次、
+  各请求不同 max_tokens、decode 中途异步到达，输出均逐 token 对齐 HF
+  （`tests/test_scheduler.py` + `tests/test_continuous_batching.py`）。
 - **R4 KV cache**：先 naive（每请求连续增长的 KV），再 paged：
   `TableManager` + `page_table` + `MHAPool` + `CacheManager`，届时引入
   `table_idx`/`token_pool`/`out_loc`，prefill 预算与 `ChunkedReq`。
