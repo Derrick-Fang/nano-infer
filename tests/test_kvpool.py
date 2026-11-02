@@ -1,21 +1,21 @@
-"""Pure-logic tests for MHAKVPool (no model loading)."""
+"""Pure-logic tests for MHAKVCache (no model loading)."""
 
 import torch
 
-from python.kvcache import MHAKVPool
+from python.kvcache import MHAKVCache
 
 L, H, D, S = 3, 2, 4, 16  # layers, kv heads, head dim, slots
 
 
-def make_pool(dtype=torch.float32) -> MHAKVPool:
-    return MHAKVPool(num_layers=L, num_kv_heads=H, head_dim=D, num_slots=S, dtype=dtype)
+def make_pool(dtype=torch.float32) -> MHAKVCache:
+    return MHAKVCache(num_layers=L, num_kv_heads=H, head_dim=D, num_slots=S, dtype=dtype)
 
 
 def test_metadata():
     pool = make_pool(dtype=torch.bfloat16)
     assert (pool.num_layers, pool.num_kv_heads, pool.head_dim, pool.num_slots) == (L, H, D, S)
     assert pool.dtype == torch.bfloat16
-    assert pool.buffer.shape == (2, L, S, H, D)
+    assert pool._kv_buffer.shape == (2, L, S, H, D)
 
 
 def test_write_then_read_roundtrip_all_layers():
@@ -33,7 +33,7 @@ def test_write_then_read_roundtrip_all_layers():
 
 def test_read_write_single_layer():
     pool = make_pool()
-    pool.buffer.zero_()
+    pool._kv_buffer.zero_()
     slots = torch.tensor([0, 5])
     key = torch.randn(2, H, D)
     value = torch.randn(2, H, D)
@@ -42,7 +42,7 @@ def test_read_write_single_layer():
     assert torch.equal(k_out, key)
     assert torch.equal(v_out, value)
     # other layers untouched
-    assert pool.buffer[:, 0].sum() == 0 and pool.buffer[:, 2].sum() == 0
+    assert pool._kv_buffer[:, 0].sum() == 0 and pool._kv_buffer[:, 2].sum() == 0
     # k and v are independent buffers
     assert not torch.equal(k_out, v_out)
 

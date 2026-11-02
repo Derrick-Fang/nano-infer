@@ -1,14 +1,16 @@
-"""BaseKVPool: the KV-cache storage interface.
+"""BaseKVCachePool: the KV-cache storage interface.
 
+Named after mini-sglang's BaseKVCachePool (python/minisgl/kvcache/base.py).
 The minimal contract: one initialization plus slot-indexed read/write.
 `token_slots` are flat int ids into the pool — exactly what
 TokenToKVPoolAllocator hands out — so the pool itself knows nothing
 about pages, requests, or sequences.
 
-Maps to mini-sglang's BaseKVCachePool (python/minisgl/kvcache/base.py);
-its per-layer surface (k_cache/v_cache/store_kv) is covered here by the
-optional `layer_id` argument on read/write plus the k_cache/v_cache
-views.
+mini-sglang's per-layer surface is `k_cache/v_cache` views plus
+`store_kv(k, v, out_loc, layer_id)`; here the same is covered by the
+k_cache/v_cache views and the optional `layer_id` argument on
+read/write (read/write/token_slots are this project's names for the
+slot-indexed gather/scatter).
 
 Shapes (L=num_layers, H=num_kv_heads, D=head_dim, n=len(token_slots)):
 - read(token_slots)              -> k, v of shape [L, n, H, D]
@@ -24,7 +26,7 @@ from abc import ABC, abstractmethod
 import torch
 
 
-class BaseKVPool(ABC):
+class BaseKVCachePool(ABC):
     def __init__(
         self,
         num_layers: int,

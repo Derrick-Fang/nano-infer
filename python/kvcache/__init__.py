@@ -1,6 +1,6 @@
 from .allocator import TokenToKVPoolAllocator
-from .base import BaseKVPool
-from .mha_pool import MHAKVPool
+from .base import BaseKVCachePool
+from .mha_pool import MHAKVCache
 from .req_to_token_pool import ReqToTokenPool
 
-__all__ = ["BaseKVPool", "MHAKVPool", "ReqToTokenPool", "TokenToKVPoolAllocator"]
+__all__ = ["BaseKVCachePool", "MHAKVCache", "ReqToTokenPool", "TokenToKVPoolAllocator"]
