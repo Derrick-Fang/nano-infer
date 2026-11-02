@@ -67,11 +67,17 @@ def apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """q/k: [batch, num_heads, seq, head_dim]; cos/sin: [batch, seq, head_dim]"""
+    """q/k: [batch, num_heads, seq, head_dim]; cos/sin: [batch, seq, head_dim]
+
+    cos/sin 表是 fp32：与 bf16 的 q/k 相乘会发生类型提升，旋转实际在
+    fp32 下完成（这正是想要的——旋转是相位敏感计算），但出口必须
+    .to(原 dtype)，否则 fp32 的 q/k 与 bf16 的 v 会在 SDPA 里报错。
+    fp32 路径下 .to 是 no-op，不影响 golden test 数值。
+    """
     cos = cos.unsqueeze(1)  # 广播到 num_heads 维
     sin = sin.unsqueeze(1)
-    q_embed = q * cos + rotate_half(q) * sin
-    k_embed = k * cos + rotate_half(k) * sin
+    q_embed = (q * cos + rotate_half(q) * sin).to(q.dtype)
+    k_embed = (k * cos + rotate_half(k) * sin).to(k.dtype)
     return q_embed, k_embed
 
 
