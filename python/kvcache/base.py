@@ -2,20 +2,20 @@
 
 Named after mini-sglang's BaseKVCachePool (python/minisgl/kvcache/base.py).
 The minimal contract: one initialization plus slot-indexed read/write.
-`token_slots` are flat int ids into the pool — exactly what
+`out_loc` are flat int ids into the pool — exactly what
 TokenToKVPoolAllocator hands out — so the pool itself knows nothing
 about pages, requests, or sequences.
 
 mini-sglang's per-layer surface is `k_cache/v_cache` views plus
 `store_kv(k, v, out_loc, layer_id)`; here the same is covered by the
 k_cache/v_cache views and the optional `layer_id` argument on
-read/write (read/write/token_slots are this project's names for the
-slot-indexed gather/scatter).
+read/write (read/write with `out_loc` are this project's spelling of
+the slot-indexed gather/scatter).
 
-Shapes (L=num_layers, H=num_kv_heads, D=head_dim, n=len(token_slots)):
-- read(token_slots)              -> k, v of shape [L, n, H, D]
-- read(token_slots, layer_id=l)  -> k, v of shape [n, H, D]
-- write(key, value, token_slots) writes the same shapes, all layers at
+Shapes (L=num_layers, H=num_kv_heads, D=head_dim, n=len(out_loc)):
+- read(out_loc)              -> k, v of shape [L, n, H, D]
+- read(out_loc, layer_id=l)  -> k, v of shape [n, H, D]
+- write(key, value, out_loc) writes the same shapes, all layers at
   once or a single layer when layer_id is given.
 """
 
@@ -45,19 +45,19 @@ class BaseKVCachePool(ABC):
 
     @abstractmethod
     def read(
-        self, token_slots: torch.Tensor, layer_id: int | None = None
+        self, out_loc: torch.Tensor, layer_id: int | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather (k, v) at token_slots; all layers unless layer_id is given."""
+        """Gather (k, v) at out_loc; all layers unless layer_id is given."""
 
     @abstractmethod
     def write(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
-        token_slots: torch.Tensor,
+        out_loc: torch.Tensor,
         layer_id: int | None = None,
     ) -> None:
-        """Scatter k/v into token_slots; all layers unless layer_id is given."""
+        """Scatter k/v into out_loc; all layers unless layer_id is given."""
 
     @abstractmethod
     def k_cache(self, layer_id: int) -> torch.Tensor:

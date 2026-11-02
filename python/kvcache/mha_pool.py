@@ -1,4 +1,4 @@
-"""MHAKVCache: the MHA/GQA KV cache, read/written by flat token slot.
+"""MHAKVCache: the MHA/GQA KV cache, read/written by out_loc slot ids.
 
 Named after mini-sglang's MHAKVCache (python/minisgl/kvcache/mha_pool.py),
 with the same buffer split: one contiguous allocation `_kv_buffer` of
@@ -41,27 +41,27 @@ class MHAKVCache(BaseKVCachePool):
         self._v_buffer = self._kv_buffer[1]
 
     def read(
-        self, token_slots: torch.Tensor, layer_id: int | None = None
+        self, out_loc: torch.Tensor, layer_id: int | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if layer_id is not None:
-            return self._k_buffer[layer_id, token_slots], self._v_buffer[layer_id, token_slots]
-        return self._k_buffer[:, token_slots], self._v_buffer[:, token_slots]
+            return self._k_buffer[layer_id, out_loc], self._v_buffer[layer_id, out_loc]
+        return self._k_buffer[:, out_loc], self._v_buffer[:, out_loc]
 
     def write(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
-        token_slots: torch.Tensor,
+        out_loc: torch.Tensor,
         layer_id: int | None = None,
     ) -> None:
         key = key.to(self._kv_buffer.dtype)
         value = value.to(self._kv_buffer.dtype)
         if layer_id is not None:
-            self._k_buffer[layer_id, token_slots] = key
-            self._v_buffer[layer_id, token_slots] = value
+            self._k_buffer[layer_id, out_loc] = key
+            self._v_buffer[layer_id, out_loc] = value
         else:
-            self._k_buffer[:, token_slots] = key
-            self._v_buffer[:, token_slots] = value
+            self._k_buffer[:, out_loc] = key
+            self._v_buffer[:, out_loc] = value
 
     def k_cache(self, layer_id: int) -> torch.Tensor:
         return self._k_buffer[layer_id]
