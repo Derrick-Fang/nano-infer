@@ -12,6 +12,10 @@ nano-vllm 那样的纯调度。
 
 返回成功写入的参数名集合，供测试做完整性校验
 （loaded == model.state_dict().keys() 才算一个不漏）。
+
+支持 mini-sglang 风格的 meta 构造：模型在 `with torch.device("meta")`
+下创建时参数只是不占内存的占位符，本函数在首次写入前将其物化
+（_materialize），dtype 沿用构造期定下的值（见 python/utils.torch_dtype）。
 """
 
 from pathlib import Path
@@ -25,7 +29,33 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
-def load_weights(model: nn.Module, model_path: str | Path) -> set[str]:
+def _materialize(model: nn.Module, device: torch.device) -> None:
+    """把 meta 设备上的参数整体落成真实存储（保留构造期定下的 shape/dtype）。
+
+    注意不能直接 `param.data = cpu_tensor`——Variable.set_data 拒绝跨
+    tensor 类型（meta vs dense），只能整个替换 Parameter 对象，并把挂在
+    旧对象上的 weight_loader 钩子搬到新对象上。
+    副作用：tied 参数（lm_head/embed_tokens）会被拆成独立存储，加载后
+    需调用 model.tie_weights() 重新共享。非 meta 模型本函数是 no-op。
+    """
+    for module in model.modules():
+        for name, param in module._parameters.items():
+            if param is not None and param.device.type == "meta":
+                new_param = nn.Parameter(
+                    torch.empty_like(param, device=device), requires_grad=False
+                )
+                if hasattr(param, "weight_loader"):
+                    new_param.weight_loader = param.weight_loader
+                module._parameters[name] = new_param
+
+
+def load_weights(
+    model: nn.Module,
+    model_path: str | Path,
+    device: str | torch.device = "cpu",
+) -> set[str]:
+    device = torch.device(device)
+    _materialize(model, device)
     config = model.config
     q_size = config.num_attention_heads * config.head_dim
     kv_size = config.num_key_value_heads * config.head_dim

@@ -22,8 +22,10 @@ from typing import NamedTuple
 import torch
 
 from python.core import Batch
+from python.layers.rotary_embedding import set_rope_device
 from python.model.loader import load_weights
 from python.model.qwen3 import Qwen3Config, Qwen3ForCausalLM
+from python.utils import torch_dtype
 
 from .config import EngineConfig
 from .sample import Sampler
@@ -37,15 +39,21 @@ class Engine:
     def __init__(self, config: EngineConfig):
         self.config = config
         model_config = Qwen3Config.from_pretrained(config.model_path)
-        self.model = Qwen3ForCausalLM(model_config)
-        # 与 tests/test_load_qwen3.py 相同的完整性校验：loader 路径写错会
-        # 静默返回空集合，必须兜底。
+        # 对齐 mini-sglang 的加载流程：meta 设备 + 默认 dtype 上下文里构造
+        # ——参数是不占内存的占位符，dtype 在构造期一次定死（layer 里裸
+        # torch.empty 跟随全局默认，无需逐个传 dtype）；RoPE 表是常数而非
+        # 权重，例外地建在真实设备上。
+        set_rope_device("cpu")
+        with torch.device("meta"), torch_dtype(config.dtype):
+            self.model = Qwen3ForCausalLM(model_config)
+        # load_weights 逐参数物化并填充；完整性校验兜底：loader 路径写错
+        # 会静默返回空集合（同 tests/test_load_qwen3.py）。
         loaded = load_weights(self.model, config.model_path)
         missing = set(self.model.state_dict()) - loaded
         assert not missing, f"以下参数未被加载: {sorted(missing)}"
-        # 注意：dtype 转换若发生拷贝会让 tied lm_head 与 embed_tokens 解除
-        # 存储共享（数值仍相同，仅多占内存；fp32 默认下不触发拷贝）。
-        self.model.to(dtype=config.dtype).eval()
+        # 逐参数物化拆开了构造期的 tied 存储，重新共享。
+        self.model.tie_weights()
+        self.model.eval()
         self.sampler = Sampler()
 
     @torch.inference_mode()

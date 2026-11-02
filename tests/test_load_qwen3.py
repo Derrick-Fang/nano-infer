@@ -47,6 +47,29 @@ def test_config_parsed():
 
 
 @needs_model
+def test_meta_construction_path():
+    """mini-sglang 风格加载：meta 构造 → 逐参数物化 → tie_weights 重绑。
+    这是 Engine 实际走的路径（tests/test_greedy_decode.py 端到端覆盖），
+    这里单独验证物化与 tie 的不变式。"""
+    from python.utils import torch_dtype
+
+    config = Qwen3Config.from_pretrained(MODEL_PATH)
+    with torch.device("meta"), torch_dtype(torch.float32):
+        model = Qwen3ForCausalLM(config)
+    loaded = load_weights(model, MODEL_PATH)
+    assert set(model.state_dict()) == loaded
+    # 无残留 meta 参数；dtype 由构造期上下文决定
+    assert all(p.device.type == "cpu" for p in model.parameters())
+    assert all(p.dtype == torch.float32 for p in model.parameters())
+    # 物化后 tied 参数是独立存储；tie_weights 后重新共享
+    model.tie_weights()
+    assert (
+        model.lm_head.weight.data_ptr()
+        == model.model.embed_tokens.weight.data_ptr()
+    )
+
+
+@needs_model
 def test_logits_match_hf(our_model):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 

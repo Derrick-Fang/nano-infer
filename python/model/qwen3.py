@@ -204,7 +204,14 @@ class Qwen3ForCausalLM(nn.Module):
         self.config = config
         self.model = Qwen3Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
+        self.tie_weights()
+
+    def tie_weights(self) -> None:
+        """lm_head 与 embed_tokens 共享存储（HF 同名约定）。
+
+        meta 构造 + loader 逐参数物化会把共享拆开（各自落成独立存储），
+        因此加载权重后必须重新调用本方法。"""
+        if self.config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(

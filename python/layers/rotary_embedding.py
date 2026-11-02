@@ -18,6 +18,17 @@ from functools import lru_cache
 import torch
 from torch import nn
 
+# RoPE 表是预计算常数而非权重：即使模型在 meta 设备上下文里构造（不
+# 占内存的占位参数），表也必须建在真实设备上——否则 meta 表会随
+# lru_cache 被全模型甚至整个进程共享，永远无法物化。
+# 对齐 mini-sglang 的 set_rope_device：Engine 在构造模型前调用。
+_rope_device = torch.device("cpu")
+
+
+def set_rope_device(device: str | torch.device) -> None:
+    global _rope_device
+    _rope_device = torch.device(device)
+
 
 class RotaryEmbedding(nn.Module):
 
@@ -25,9 +36,13 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.head_dim = head_dim
         inv_freq = 1.0 / (
-            base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+            base
+            ** (
+                torch.arange(0, head_dim, 2, dtype=torch.float32, device=_rope_device)
+                / head_dim
+            )
         )
-        t = torch.arange(max_position_embeddings, dtype=torch.float32)
+        t = torch.arange(max_position_embeddings, dtype=torch.float32, device=_rope_device)
         freqs = torch.outer(t, inv_freq)  # [max_pos, head_dim/2]
         emb = torch.cat([freqs, freqs], dim=-1)  # [max_pos, head_dim]
         # persistent=False：不进 state_dict，加载权重时不受干扰
