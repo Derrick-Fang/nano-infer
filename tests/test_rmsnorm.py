@@ -19,7 +19,8 @@ def test_rmsnorm_matches_hf():
 
 
 def test_rmsnorm_head_dim_usage():
-    # QK-Norm 场景：最后一维是 head_dim 而非 hidden_size，同一个类应正常工作
+    # QK-Norm scenario: the last dim is head_dim rather than hidden_size;
+    # the same class should work unchanged
     norm = RMSNorm(64)
     x = torch.randn(2, 8, 5, 64)  # [batch, heads, seq, head_dim]
     assert norm(x).shape == x.shape

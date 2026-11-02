@@ -1,4 +1,4 @@
-"""core.py 的纯逻辑测试（不依赖模型权重）。"""
+"""Pure-logic tests for core.py (no model weights needed)."""
 
 import pytest
 
@@ -21,7 +21,7 @@ def test_initial_accounting():
     assert req.device_len == 3
     assert req.max_device_len == 3 + 5
     assert req.cached_len == 0
-    assert req.extend_len == 3  # prefill 要算全部 prompt
+    assert req.extend_len == 3  # prefill computes the whole prompt
     assert req.remain_len == 5
     assert req.can_decode
 
@@ -32,7 +32,8 @@ def test_empty_prompt_rejected():
 
 
 def test_complete_one_and_append():
-    # mini-sglang 的配对用法：forward 后 complete_one()，采样结果 append_host()
+    # mini-sglang's paired usage: complete_one() after the forward, then
+    # append_host() with the sampled token
     req = make_req()
     req.complete_one()
     req.append_host(99)
@@ -44,9 +45,10 @@ def test_complete_one_and_append():
 
 def test_extend_len_decode_step():
     req = make_req()
-    req.complete_one()  # prefill 完成：cached 追上 device
+    req.complete_one()  # prefill done: cached catches up with device
     req.append_host(99)
-    # decode 每步前向只算 1 个新 token（complete_one 预支的那个）
+    # each decode forward computes only 1 new token (the one complete_one
+    # accounted for in advance)
     assert req.extend_len == 1
 
 
@@ -62,7 +64,7 @@ def test_can_decode_until_max_tokens():
 
 
 def test_eq_false_identity_hash():
-    # DecodeManager.running_reqs 是 set[Req]，必须按身份哈希
+    # DecodeManager.running_reqs is a set[Req] and must hash by identity
     a, b = make_req(uid=0), make_req(uid=0)
     assert a != b
     assert len({a, b}) == 2

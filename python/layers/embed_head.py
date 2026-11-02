@@ -1,10 +1,13 @@
-"""Embedding / LMHead（照抄 nano-vllm layers/embed_head.py，TP 退化为单机）。
+"""Embedding / LMHead (verbatim port of nano-vllm layers/embed_head.py,
+with TP degenerated to single-device).
 
-与 nano-vllm 的差异：
-- tp_size=1，去掉 vocab 分片 mask / all_reduce / gather 逻辑
-- ParallelLMHead 暂不取 "每个序列最后一个 token"（nano-vllm 靠
-  context.cu_seqlens_q 在 prefill 末尾抽位置），该优化等 paged 阶段
-  引入 context 后再加；现在对完整 hidden_states 算 logits
+Differences from nano-vllm:
+- tp_size=1: the vocab-shard mask / all_reduce / gather logic is dropped;
+- ParallelLMHead does not yet select "the last token of each sequence"
+  (nano-vllm extracts positions at the end of prefill via
+  context.cu_seqlens_q) — that optimization waits until the paged stage
+  introduces context; for now logits are computed over the full
+  hidden_states.
 """
 
 import torch

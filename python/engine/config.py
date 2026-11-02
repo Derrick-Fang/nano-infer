@@ -1,8 +1,8 @@
-"""EngineConfig：引擎配置。
+"""EngineConfig: engine configuration.
 
-对齐 mini-sglang 的 `engine/config.py`，但按 AGENT.md 的约定只保留当前
-用到的字段；max_running_req / page_size / max_extend_tokens 等随
-R3/R4 引入（届时再拆出 SchedulerConfig）。
+Mirrors mini-sglang's `engine/config.py`, but per AGENT.md only the fields
+currently in use are kept; page_size / max_extend_tokens etc. arrive with
+R3/R4 (SchedulerConfig is then split out).
 """
 
 from dataclasses import dataclass
@@ -13,7 +13,9 @@ import torch
 @dataclass(frozen=True)
 class EngineConfig:
     model_path: str
-    # golden test 以对齐 HF fp32 为准；权重是 BF16，copy_ 加载时自动升精度。
+    # The golden test targets HF fp32 parity; the weights are BF16 and are
+    # upcast automatically by copy_ during loading.
     dtype: torch.dtype = torch.bfloat16
-    # 同时在跑的最大请求数（R3 起是唯一准入约束；KV cache 引入后另有显存约束）。
+    # Max requests running concurrently (the only admission constraint
+    # since R3; a memory constraint joins it once the KV cache exists).
     max_running_req: int = 256

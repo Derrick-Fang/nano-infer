@@ -1,11 +1,15 @@
-"""Linear 层（照抄 nano-vllm layers/linear.py，TP 退化为单机）。
+"""Linear layers (verbatim port of nano-vllm layers/linear.py, with TP
+degenerated to single-device).
 
-与 nano-vllm 的唯一差异：本工程不初始化 torch.distributed，
-get_tp_rank()/get_tp_size() 恒返回 0/1，所有 "Parallel" 层实际都是
-完整权重（replicated）。保留 tp_dim / weight_loader 机制的原因：
-- weight_loader 把 "checkpoint 分片 -> packed 参数" 的切片逻辑收敛到
-  每个参数自己身上（vLLM 的核心设计），loader 因此可以是通用的
-- 之后接 TP 时只需让 helper 返回真实 rank/world_size
+The only difference from nano-vllm: this project never initializes
+torch.distributed, so get_tp_rank()/get_tp_size() always return 0/1 and
+every "Parallel" layer actually holds the full weight (replicated).
+Reasons for keeping the tp_dim / weight_loader machinery:
+- weight_loader confines the "checkpoint shard -> packed parameter"
+  slicing logic to each parameter itself (a core vLLM design), so the
+  loader can stay generic;
+- wiring up real TP later only requires the helpers to return the actual
+  rank/world_size.
 """
 
 import torch

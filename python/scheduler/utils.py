@@ -1,7 +1,8 @@
-"""调度器内部的小数据结构。
+"""Small scheduler-internal data structures.
 
-对齐 mini-sglang 的 `scheduler/utils.py`。`ScheduleResult` 不搬运
-（mini-sglang 里它服务于 overlap 调度，本项目只做同步 normal_loop）。
+Mirrors mini-sglang's `scheduler/utils.py`. `ScheduleResult` is not ported
+(it serves overlap scheduling in mini-sglang; this project only implements
+the synchronous normal_loop).
 """
 
 from dataclasses import dataclass
@@ -11,15 +12,18 @@ from python.core import SamplingParams
 
 @dataclass
 class PendingReq:
-    """尚未被调度的新请求（PrefillManager.pending_list 的元素）。
+    """A new request that has not been scheduled yet (element of
+    PrefillManager.pending_list).
 
-    与 Req 的区别：PendingReq 还没经过准入，没有长度记账（cached_len 等）；
-    它被 PrefillAdder 接纳后才变成 Req。mini-sglang 的 PendingReq 还有
-    `chunked_req` 字段指回切chunk 中的 Req——ChunkedReq 属于 R4，届时再加。
+    Difference from Req: a PendingReq has not passed admission and has no
+    length bookkeeping (cached_len etc.); it becomes a Req only when
+    accepted by the PrefillAdder. mini-sglang's PendingReq also has a
+    `chunked_req` field pointing back to the in-flight chunked Req —
+    ChunkedReq belongs to R4 and will be added then.
     """
 
     uid: int
-    input_ids: list[int]  # 仅 prompt；对齐 Req.input_ids 用 list[int]
+    input_ids: list[int]  # prompt only; list[int] to match Req.input_ids
     sampling_params: SamplingParams
 
     @property

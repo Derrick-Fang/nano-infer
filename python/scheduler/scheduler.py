@@ -1,18 +1,23 @@
-"""Scheduler：主循环，串联 Prefill/DecodeManager 与 Engine。
+"""Scheduler: the main loop, wiring Prefill/DecodeManager to the Engine.
 
-对齐 mini-sglang 的 `scheduler/scheduler.py`，按 AGENT.md 的有意偏离：
+Mirrors mini-sglang's `scheduler/scheduler.py`, with AGENT.md's
+intentional deviations:
 
-- **无消息层**：不做 receive_msg/_process_one_msg，新请求由调用方（LLM）
-  直接构造 `PendingReq` 交给 `add_request`（对应 mini-sglang 里 UserMsg
-  分支干的事）；结果也不发 DetokenizeMsg，结束的 Req 累积在
-  `finished_reqs` 里由 LLM 收割（Req.input_ids 是唯一事实来源，直接读）。
-- **无 overlap**：只实现完全同步的 `normal_loop`——schedule → forward →
-  process 依次做完才进入下一轮（CPU 上 stream/event 无意义）。
-- **无 KV cache**：没有 TableManager/CacheManager，也就没有
-  _free_req_resources / cache_req；max_tokens 对 max_seq_len 的钳制
-  也随 EngineConfig.max_seq_len 一起留待后续（当前无此字段）。
-- tokenizer 由 Scheduler 持有（对齐 mini-sglang），用于 eos 判定；
-  LLM 作为子类直接复用它做 encode/decode。
+- **No message layer**: no receive_msg/_process_one_msg; callers (LLM)
+  construct `PendingReq` directly and hand it to `add_request` (the
+  equivalent of mini-sglang's UserMsg branch); results are not sent as
+  DetokenizeMsg either — finished Reqs accumulate in `finished_reqs` for
+  the LLM to harvest (Req.input_ids is the single source of truth and is
+  read directly).
+- **No overlap**: only the fully synchronous `normal_loop` — schedule →
+  forward → process complete in order before the next round (streams and
+  events are meaningless on CPU).
+- **No KV cache**: no TableManager/CacheManager, hence no
+  _free_req_resources / cache_req; clamping max_tokens against
+  max_seq_len is deferred together with EngineConfig.max_seq_len (no such
+  field yet).
+- The tokenizer is held by the Scheduler (mirrors mini-sglang) for eos
+  detection; LLM, as a subclass, reuses it for encode/decode.
 """
 
 from transformers import AutoTokenizer
@@ -35,40 +40,48 @@ class Scheduler:
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
-        # 离线版的结果收集：结束的 Req 累积在这里，由 LLM.generate 收割。
-        # mini-sglang 的同名集合是 overlap 模式下防重复释放的瞬态集合，
-        # 这里用途不同（无消息层，Req 本身就是结果载体）。
+        # Result collection for the offline version: finished Reqs
+        # accumulate here and are harvested by LLM.generate. mini-sglang's
+        # same-named set is a transient guard against double-free under
+        # overlap scheduling; the purpose differs here (no message layer —
+        # the Req itself is the result carrier).
         self.finished_reqs: list[Req] = []
 
     def add_request(self, req: PendingReq) -> None:
-        """新请求入口，对应 mini-sglang `_process_one_msg` 的 UserMsg 分支。"""
+        """Entry point for new requests; corresponds to the UserMsg branch
+        of mini-sglang's `_process_one_msg`."""
         self.prefill_manager.add_one_req(req)
 
     @property
     def runnable(self) -> bool:
-        """离线主循环的继续条件：还有等待 prefill 或正在 decode 的请求。"""
+        """Continue condition of the offline main loop: requests still
+        waiting for prefill or currently decoding."""
         return self.prefill_manager.runnable or self.decode_manager.runnable
 
     def normal_loop(self) -> None:
-        """同步主循环的一次迭代：schedule → forward → process。"""
+        """One iteration of the synchronous main loop: schedule → forward
+        → process."""
         batch = self._schedule_next_batch()
         if batch is None:
             return
         output = self.engine.forward_batch(batch)
-        # 对齐 mini-sglang `_forward`：前向一结束就把本批 req 并入 decode
-        # 集合（complete_one 已在 Engine 内完成，can_decode 判定有效）。
+        # Mirrors mini-sglang's `_forward`: merge this batch's reqs into
+        # the decode set right after the forward (complete_one has already
+        # run inside the Engine, so the can_decode check is valid).
         self.decode_manager.filter_reqs(batch.reqs)
         self._process_last_data(batch, output)
 
     def _schedule_next_batch(self) -> Batch | None:
-        # prefill 优先于 decode（对齐 mini-sglang；decode 优先是 TODO 项）。
+        # Prefill takes priority over decode (mirrors mini-sglang;
+        # decode-first is a TODO there too).
         return (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
 
     def _process_last_data(self, batch: Batch, output: ForwardOutput) -> None:
-        """停止判定（eos / max_tokens）在这里做，对齐 `_process_last_data`。"""
+        """Stop conditions (eos / max_tokens) are checked here, mirroring
+        `_process_last_data`."""
         for req, next_token in zip(batch.reqs, output.next_tokens):
             req.append_host(next_token)
             finished = not req.can_decode or (

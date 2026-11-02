@@ -1,11 +1,14 @@
-"""RMSNorm（照抄 nano-vllm layers/layernorm.py，去掉 @torch.compile）。
+"""RMSNorm (verbatim port of nano-vllm layers/layernorm.py, without
+@torch.compile).
 
-forward 接受可选的 residual：
-- residual=None：普通 RMSNorm（first layernorm / QK-Norm 场景）
-- 传入 residual：先残差相加再归一化，返回 (normalized, new_residual)
-  ——nano-vllm 用它在 DecoderLayer 里隐式表达残差流
+forward accepts an optional residual:
+- residual=None: plain RMSNorm (first layernorm / QK-Norm scenarios);
+- with residual: add the residual first, then normalize, and return
+  (normalized, new_residual) — nano-vllm uses this to thread the residual
+  stream implicitly through DecoderLayer.
 
-数值与 HF Qwen3RMSNorm 对齐：方差在 float32 下计算后转回输入 dtype。
+Numerics match HF Qwen3RMSNorm: the variance is computed in float32 and
+the result is cast back to the input dtype.
 """
 
 import torch
@@ -30,8 +33,9 @@ class RMSNorm(nn.Module):
         orig_dtype = x.dtype
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        # 注意：不用 nano-vllm 的 in-place mul_——x 为 fp32 时 x.float()
-        # 返回原 tensor，in-place 会污染调用方（残差流）的输入
+        # Note: not using nano-vllm's in-place mul_ — when x is fp32,
+        # x.float() returns the same tensor, and an in-place op would
+        # pollute the caller's input (the residual stream).
         x = x * torch.rsqrt(var + self.eps)
         return self.weight * x.to(orig_dtype)
 

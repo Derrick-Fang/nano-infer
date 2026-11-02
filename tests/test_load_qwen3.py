@@ -1,11 +1,14 @@
-"""用真实的 Qwen3-0.6B config + weights 验证模型能被正确加载。
+"""Verifies the model loads correctly with the real Qwen3-0.6B config +
+weights.
 
-两层校验：
-1. 完整性：HF 权重文件里的每个 tensor 都落到了本模型的参数上，
-   且本模型没有参数被漏加载（loaded == state_dict）。
-2. 数值：同一输入下本模型的 logits 与 HF Qwen3ForCausalLM 对齐
-   ——这是比"权重拷贝成功"更强的正确性证据（验证了 QK-Norm、
-   RoPE、GQA、packed 拼接等所有环节串起来的结果）。
+Two levels of checking:
+1. Completeness: every tensor in the HF weight files lands on a parameter
+   of our model, and no parameter of ours is left unloaded
+   (loaded == state_dict).
+2. Numerics: for the same input, our model's logits match HF
+   Qwen3ForCausalLM — much stronger evidence than "weights copied"
+   (it validates QK-Norm, RoPE, GQA, packed concatenation, and everything
+   else wired together).
 """
 
 from pathlib import Path
@@ -20,7 +23,7 @@ MODEL_PATH = Path(__file__).parent.parent.parent / "data" / "Qwen3-0.6B"
 
 needs_model = pytest.mark.skipif(
     not (MODEL_PATH / "model.safetensors").exists(),
-    reason=f"本地权重不存在: {MODEL_PATH}",
+    reason=f"local weights not found: {MODEL_PATH}",
 )
 
 
@@ -29,9 +32,10 @@ def our_model():
     config = Qwen3Config.from_pretrained(MODEL_PATH)
     model = Qwen3ForCausalLM(config)
     loaded = load_weights(model, MODEL_PATH)
-    # 完整性校验：每个参数都被加载（tied lm_head 由 loader 视为已加载）
+    # Completeness check: every parameter is loaded (the tied lm_head is
+    # considered loaded by the loader)
     missing = set(model.state_dict()) - loaded
-    assert not missing, f"以下参数未被加载: {sorted(missing)}"
+    assert not missing, f"parameters not loaded: {sorted(missing)}"
     return model.eval()
 
 
@@ -48,9 +52,11 @@ def test_config_parsed():
 
 @needs_model
 def test_meta_construction_path():
-    """mini-sglang 风格加载：meta 构造 → 逐参数物化 → tie_weights 重绑。
-    这是 Engine 实际走的路径（tests/test_greedy_decode.py 端到端覆盖），
-    这里单独验证物化与 tie 的不变式。"""
+    """mini-sglang-style loading: meta construction -> per-parameter
+    materialization -> tie_weights re-binding.
+    This is the path the Engine actually takes (covered end-to-end by
+    tests/test_greedy_decode.py); here we verify the materialization and
+    tying invariants in isolation."""
     from python.utils import torch_dtype
 
     config = Qwen3Config.from_pretrained(MODEL_PATH)
@@ -58,10 +64,11 @@ def test_meta_construction_path():
         model = Qwen3ForCausalLM(config)
     loaded = load_weights(model, MODEL_PATH)
     assert set(model.state_dict()) == loaded
-    # 无残留 meta 参数；dtype 由构造期上下文决定
+    # No meta parameters left; dtype is decided by the construction context
     assert all(p.device.type == "cpu" for p in model.parameters())
     assert all(p.dtype == torch.float32 for p in model.parameters())
-    # 物化后 tied 参数是独立存储；tie_weights 后重新共享
+    # After materialization the tied parameters are independent storage;
+    # tie_weights() re-shares them
     model.tie_weights()
     assert (
         model.lm_head.weight.data_ptr()
@@ -85,5 +92,5 @@ def test_logits_match_hf(our_model):
 
     assert ours.shape == ref.shape
     torch.testing.assert_close(ours, ref, rtol=1e-3, atol=1e-3)
-    # greedy 下一步 token 一致
+    # same greedy next token
     assert ours[0, -1].argmax().item() == ref[0, -1].argmax().item()

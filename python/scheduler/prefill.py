@@ -1,15 +1,22 @@
-"""PrefillManager + PrefillAdder：新请求的准入与 prefill 批的组批。
+"""PrefillManager + PrefillAdder: admission of new requests and assembly
+of prefill batches.
 
-对齐 mini-sglang 的 `scheduler/prefill.py`，按 R3（无 KV cache）简化：
+Mirrors mini-sglang's `scheduler/prefill.py`, simplified for R3 (no KV
+cache):
 
-- mini-sglang 的准入受三类资源约束：page_table 行数（TableManager）、
-  KV cache 页数（CacheManager）、token 预算（chunked prefill）。R3 没有
-  KV cache，前两项退化为 `max_running_req` 一个整数（由 PrefillManager
-  结合 DecodeManager 的在跑数换算成本批可新纳入的名额）；
-- token 预算（`max_extend_tokens`）保留，但 R3 没有 `ChunkedReq`，无法
-  把超长 prompt 切成多轮 prefill——单条请求超出整个预算时，若它是本批
-  第一条则整批放行（否则它将永远无法被调度），切分留给 R4；
-- 无 prefix cache 匹配，`cached_len` 恒为 0，extend_len 即 prompt 全长。
+- mini-sglang's admission is bounded by three kinds of resources:
+  page_table rows (TableManager), KV-cache pages (CacheManager), and the
+  token budget (chunked prefill). R3 has no KV cache, so the first two
+  degenerate to a single integer `max_running_req` (PrefillManager
+  converts it into this batch's free slots using DecodeManager's running
+  count);
+- the token budget (`max_extend_tokens`) is kept, but R3 has no
+  `ChunkedReq`, so an over-long prompt cannot be split across prefill
+  rounds — a single request exceeding the whole budget is admitted whole
+  if it is the first of the batch (otherwise it could never be
+  scheduled); splitting is left to R4;
+- no prefix-cache matching: `cached_len` is always 0 and extend_len is
+  the full prompt length.
 """
 
 from dataclasses import dataclass, field
@@ -22,20 +29,24 @@ from .utils import PendingReq
 
 @dataclass
 class PrefillAdder:
-    """一次 prefill 组批的准入器：带着当轮的预算/名额，逐个尝试接纳
-    pending 请求。每次 schedule_next_batch 新建一个（预算按轮重置）。"""
+    """Admission helper for one prefill batching round: carries the
+    round's budget/slots and tries to accept pending requests one by one.
+    A new instance is created per schedule_next_batch call (budgets reset
+    every round)."""
 
     token_budget: int
-    max_new_reqs: int  # 本批还允许新纳入的请求数 = max_running_req - 在跑数
+    max_new_reqs: int  # free slots for new requests in this batch = max_running_req - running
     num_added: int = 0
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
         if self.num_added >= self.max_new_reqs:
             return None
-        extend_len = pending_req.input_len  # 无 prefix cache，cached_len 恒 0
+        extend_len = pending_req.input_len  # no prefix cache, cached_len is always 0
         if extend_len > self.token_budget and self.num_added > 0:
-            # 预算装不下就等下一轮；若单条就超整个预算（num_added == 0 时
-            # 才会走到下面），则整批放行——R4 的 ChunkedReq 才能真正切分。
+            # Doesn't fit the budget — wait for the next round. (A single
+            # request exceeding the whole budget only gets through when
+            # num_added == 0 below, admitted as a batch of its own; R4's
+            # ChunkedReq will split it properly.)
             return None
         self.token_budget -= extend_len
         self.num_added += 1
@@ -50,10 +61,11 @@ class PrefillAdder:
 
 @dataclass
 class PrefillManager:
-    """持有 pending_list（等待 prefill 的队列），按 FIFO 准入。
+    """Owns pending_list (the queue awaiting prefill); admission is FIFO.
 
-    对齐 mini-sglang：准入失败即停止扫描（不在队列里跳跃式挑选），
-    被跳过的请求留到下一轮。"""
+    Mirrors mini-sglang: stop scanning at the first admission failure (no
+    skipping ahead in the queue); skipped requests wait for the next
+    round."""
 
     max_running_req: int
     decode_manager: DecodeManager

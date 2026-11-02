@@ -1,7 +1,8 @@
-"""Sampler：从 logits 出 next token。
+"""Sampler: logits -> next token.
 
-对齐 mini-sglang 的 `engine/sample.py`。当前只支持 greedy（argmax）；
-temperature / top_k / top_p 与 BatchSamplingArgs 在 R5 引入。
+Mirrors mini-sglang's `engine/sample.py`. Only greedy (argmax) is
+supported for now; temperature / top_k / top_p and BatchSamplingArgs
+arrive in R5.
 """
 
 from dataclasses import dataclass
@@ -12,5 +13,5 @@ import torch
 @dataclass
 class Sampler:
     def sample(self, logits: torch.Tensor) -> torch.Tensor:
-        """logits: [batch, vocab] -> [batch]，每行取 argmax（greedy）。"""
+        """logits: [batch, vocab] -> [batch]; argmax per row (greedy)."""
         return logits.argmax(dim=-1)

@@ -1,16 +1,20 @@
-"""旋转位置编码 RoPE（与 HF Qwen3RotaryEmbedding 数值对齐）。
+"""Rotary position embedding, RoPE (numerically aligned with HF
+Qwen3RotaryEmbedding).
 
-预计算 [max_position, head_dim] 的 cos/sin 表，forward 按绝对位置查表
-——decode 阶段每个请求只有 1 个新 token，positions 就是它的绝对位置，
-同一张表天然支持 KV cache 场景。
+Precomputes [max_position, head_dim] cos/sin tables; forward looks them up
+by absolute position — in the decode phase each request has only 1 new
+token, whose positions are exactly its absolute positions, so the same
+table naturally supports the KV-cache scenario.
 
-与 nano-vllm layers/rotary_embedding.py 的差异：nano-vllm 作用于展平的
-[num_tokens, heads, head_dim]（配合 paged attention），本实现保留
-[batch, seq, ...] 形状，等 KV cache/paged 阶段再切过去。数学上两者等价
-（nano-vllm 的 y1=x1*cos-x2*sin / y2=x2*cos+x1*sin 展开后就是
-half-split 的 rotate_half 约定）。
+Difference from nano-vllm layers/rotary_embedding.py: nano-vllm operates
+on flattened [num_tokens, heads, head_dim] tensors (paired with paged
+attention), while this implementation keeps [batch, seq, ...] shapes and
+will switch over at the KV-cache/paged stage. Mathematically the two are
+equivalent (nano-vllm's y1=x1*cos-x2*sin / y2=x2*cos+x1*sin expands to
+the half-split rotate_half convention).
 
-get_rope 照抄 nano-vllm：lru_cache 保证全模型共享同一张表。
+get_rope is a verbatim port of nano-vllm: lru_cache makes the whole model
+share a single table.
 """
 
 from functools import lru_cache
@@ -18,10 +22,13 @@ from functools import lru_cache
 import torch
 from torch import nn
 
-# RoPE 表是预计算常数而非权重：即使模型在 meta 设备上下文里构造（不
-# 占内存的占位参数），表也必须建在真实设备上——否则 meta 表会随
-# lru_cache 被全模型甚至整个进程共享，永远无法物化。
-# 对齐 mini-sglang 的 set_rope_device：Engine 在构造模型前调用。
+# RoPE tables are precomputed constants, not weights: even when the model
+# is constructed under a meta-device context (parameters being memory-free
+# placeholders), the tables must be built on a real device — otherwise a
+# meta table would be shared by the whole model, even the whole process,
+# via lru_cache and could never be materialized.
+# Mirrors mini-sglang's set_rope_device: the Engine calls it before
+# constructing the model.
 _rope_device = torch.device("cpu")
 
 
@@ -45,17 +52,17 @@ class RotaryEmbedding(nn.Module):
         t = torch.arange(max_position_embeddings, dtype=torch.float32, device=_rope_device)
         freqs = torch.outer(t, inv_freq)  # [max_pos, head_dim/2]
         emb = torch.cat([freqs, freqs], dim=-1)  # [max_pos, head_dim]
-        # persistent=False：不进 state_dict，加载权重时不受干扰
+        # persistent=False: kept out of state_dict so weight loading is unaffected
         self.register_buffer("cos", emb.cos(), persistent=False)
         self.register_buffer("sin", emb.sin(), persistent=False)
 
     def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """positions: [batch, seq] 或 [seq] -> cos/sin: [batch, seq, head_dim]"""
+        """positions: [batch, seq] or [seq] -> cos/sin: [batch, seq, head_dim]"""
         return self.cos[positions], self.sin[positions]
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """half-split 约定：rotate_half([x1, x2]) = [-x2, x1]。"""
+    """Half-split convention: rotate_half([x1, x2]) = [-x2, x1]."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat([-x2, x1], dim=-1)
@@ -69,12 +76,14 @@ def apply_rotary_pos_emb(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """q/k: [batch, num_heads, seq, head_dim]; cos/sin: [batch, seq, head_dim]
 
-    cos/sin 表是 fp32：与 bf16 的 q/k 相乘会发生类型提升，旋转实际在
-    fp32 下完成（这正是想要的——旋转是相位敏感计算），但出口必须
-    .to(原 dtype)，否则 fp32 的 q/k 与 bf16 的 v 会在 SDPA 里报错。
-    fp32 路径下 .to 是 no-op，不影响 golden test 数值。
+    The cos/sin tables are fp32: multiplying them with bf16 q/k triggers
+    type promotion, so the rotation is effectively done in fp32 (which is
+    exactly what we want — rotation is phase-sensitive), but the output
+    must be cast back with .to(orig dtype); otherwise fp32 q/k would hit
+    bf16 v inside SDPA and raise. On the fp32 path .to is a no-op and the
+    golden-test numerics are unaffected.
     """
-    cos = cos.unsqueeze(1)  # 广播到 num_heads 维
+    cos = cos.unsqueeze(1)  # broadcast over the num_heads dim
     sin = sin.unsqueeze(1)
     q_embed = (q * cos + rotate_half(q) * sin).to(q.dtype)
     k_embed = (k * cos + rotate_half(k) * sin).to(k.dtype)
@@ -83,5 +92,6 @@ def apply_rotary_pos_emb(
 
 @lru_cache(1)
 def get_rope(head_dim: int, max_position: int, base: float) -> RotaryEmbedding:
-    """全模型共享一份 RoPE 表（28 层各建一份在 fp32 下约浪费 900MB）。"""
+    """The whole model shares one RoPE table (one per layer would waste
+    ~900MB under fp32 for the 28 layers)."""
     return RotaryEmbedding(head_dim, max_position, base)

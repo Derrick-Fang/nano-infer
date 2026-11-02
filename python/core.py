@@ -1,16 +1,19 @@
-"""核心数据结构：SamplingParams / Req / Batch。
+"""Core data structures: SamplingParams / Req / Batch.
 
-对齐 mini-sglang 的 `minisgl/core.py`，是 runtime 各组件（scheduler、
-engine、kvcache）之间传递的基本类型。
+Mirrors mini-sglang's `minisgl/core.py`; these are the basic types passed
+between the runtime components (scheduler, engine, kvcache).
 
-有意偏离 mini-sglang 之处（AGENT.md "Runtime Design" 已声明）：
-- `Req.input_ids` 用 `list[int]` 而非 host tensor——引入 token_pool（R4）
-  之前没有设备侧 token 存储，list 更简单；
-- 暂不搬运 `table_idx` / `cache_handle` 字段——它们属于 KV 阶段（R4 的
-  TableManager / CacheManager 引入时再加）；
-- `Batch` 暂不搬运 `input_ids/positions/out_loc/padded_reqs/attn_metadata`
-  等由 scheduler/attention backend 填充的字段（R3/R4 再加）；
-- `Context`（全局上下文）本阶段不搬运，R6 视需要引入。
+Intentional deviations from mini-sglang (declared in AGENT.md "Runtime
+Design"):
+- `Req.input_ids` is a `list[int]` instead of a host tensor — there is no
+  device-side token storage until token_pool arrives (R4), and a list is
+  simpler;
+- `table_idx` / `cache_handle` are not ported yet — they belong to the KV
+  cache stage (added when R4 introduces TableManager / CacheManager);
+- `Batch` does not yet carry `input_ids/positions/out_loc/padded_reqs/
+  attn_metadata`, which are filled by the scheduler/attention backend
+  (added in R3/R4);
+- `Context` (global context) is not ported at this stage; R6 will decide.
 """
 
 from dataclasses import dataclass
@@ -19,8 +22,9 @@ from typing import Literal
 
 @dataclass
 class SamplingParams:
-    """采样参数。greedy 阶段（R2 的 golden test）只用 max_tokens / ignore_eos，
-    temperature/top_k/top_p 在 R5 接入 sampler。"""
+    """Sampling parameters. The greedy stage (R2's golden test) only uses
+    max_tokens / ignore_eos; temperature/top_k/top_p are wired into the
+    sampler in R5."""
 
     temperature: float = 0.0
     top_k: int = -1
@@ -33,48 +37,53 @@ class SamplingParams:
         return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
 
 
-@dataclass(eq=False)  # eq=False: 保持按身份比较/哈希，Req 将来要放进 DecodeManager 的 set 里
+@dataclass(eq=False)  # eq=False: keep identity-based compare/hash — Req will go into DecodeManager's set
 class Req:
-    """一个生成请求。
+    """One generation request.
 
-    与 mini-sglang 一致：Req 自身不携带 status 枚举，请求处于哪个阶段由
-    它在哪个 Manager 的队列里表达（pending_list / running_reqs / 被移除）。
+    As in mini-sglang: Req itself carries no status enum; which stage a
+    request is in is expressed by which Manager's queue it sits in
+    (pending_list / running_reqs / removed).
 
-    不变式：input_ids 是唯一事实来源，prompt 与生成部分不做区分存储；
-    长度全部由三个整数记账——cached_len ≤ device_len ≤ max_device_len。
+    Invariant: input_ids is the single source of truth — prompt and
+    generated parts are not stored separately; all lengths are tracked by
+    three integers: cached_len ≤ device_len ≤ max_device_len.
     """
 
-    input_ids: list[int]  # prompt + 已生成的 token，只增长
-    cached_len: int  # 前向已处理（有 KV）的 token 数；无 KV cache 时仅作记账
-    output_len: int  # 允许生成的最大 token 数（= sampling_params.max_tokens）
+    input_ids: list[int]  # prompt + generated tokens; append-only
+    cached_len: int  # tokens already forwarded (with KV); bookkeeping only while there is no KV cache
+    output_len: int  # max tokens allowed to generate (= sampling_params.max_tokens)
     uid: int
     sampling_params: SamplingParams
 
     def __post_init__(self) -> None:
-        assert self.input_ids, "prompt 不能为空"
+        assert self.input_ids, "prompt must not be empty"
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
 
     @property
     def remain_len(self) -> int:
-        """还允许生成多少 token。"""
+        """How many more tokens may be generated."""
         return self.max_device_len - self.device_len
 
     @property
     def extend_len(self) -> int:
-        """本次 prefill 前向要算的 token 数（扣除已缓存前缀）。"""
+        """How many tokens this prefill forward must compute (excluding the
+        already-cached prefix)."""
         return self.device_len - self.cached_len
 
     def complete_one(self) -> None:
-        """前向完成一步后的记账：已处理部分推进到 device_len，长度 +1
-        （新 token 由 append_host 补上，二者配对出现）。"""
+        """Bookkeeping after one forward step: the processed prefix advances
+        to device_len, and the length grows by 1 (the new token is filled in
+        by append_host — the two always come in a pair)."""
         self.cached_len = self.device_len
         self.device_len += 1
 
     def append_host(self, next_token: int) -> None:
-        """把采样出的 token 追加到 host 侧序列。
-        mini-sglang 同名方法接收 tensor 并 torch.cat；我们用 list[int]。"""
+        """Append the sampled token to the host-side sequence.
+        mini-sglang's same-named method takes a tensor and torch.cat's it;
+        we use list[int]."""
         self.input_ids.append(next_token)
 
     @property
@@ -91,10 +100,12 @@ class Req:
 
 @dataclass
 class Batch:
-    """一次前向的最小调度单位：一组同阶段的 Req。
+    """The minimal scheduling unit of one forward: a group of Reqs in the
+    same phase.
 
-    phase 用字符串字面量而非枚举（对齐 mini-sglang），prefill 与 decode
-    永远不会混在同一个 Batch 里——这是调度器（R3）维持的不变式。
+    phase is a string literal rather than an enum (mirrors mini-sglang);
+    prefill and decode never mix in the same Batch — an invariant
+    maintained by the scheduler (R3).
     """
 
     reqs: list[Req]

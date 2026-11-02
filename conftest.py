@@ -1,4 +1,4 @@
-# 让 pytest 能从仓库根目录 import python 包
+# Let pytest import the `python` package from the repo root
 import sys
 from pathlib import Path
 

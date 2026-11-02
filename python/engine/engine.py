@@ -1,20 +1,24 @@
-"""Engine：模型执行器。
+"""Engine: the model executor.
 
-对齐 mini-sglang 的 `engine/engine.py`：持有 model 与 sampler，对外只暴露
-`forward_batch(batch) -> ForwardOutput`。
+Mirrors mini-sglang's `engine/engine.py`: holds the model and the sampler,
+and exposes only `forward_batch(batch) -> ForwardOutput`.
 
-naive 版（R2）的有意简化：
-- **无 KV cache**：每步对每个 req 用完整 input_ids 全量重算，正确性优先；
-- **逐 req 循环**而非真正的 batch 前向——mini-sglang 把所有 req 的 token
-  展平拼接成一次前向，那依赖 KV cache 的 out_loc 写入与 attention backend
-  的 metadata，属于 R4；当前逐 req 跑恰恰保证 batch 内各请求互不影响，
-  使 golden test 能与 HF 的单条 generate() 直接对拍；
-- ForwardOutput 只有一份 next_tokens（单机 CPU，无 gpu/cpu 双份与
-  copy_done event）。
+Intentional simplifications of the naive version (R2):
+- **No KV cache**: every step recomputes each req over its full input_ids —
+  correctness first;
+- **Per-req loop** instead of a true batched forward — mini-sglang flattens
+  all reqs' tokens into a single forward, which depends on KV-cache out_loc
+  writes and attention-backend metadata (R4). Running req by req for now
+  guarantees the requests in a batch cannot affect each other, so the
+  golden test can be compared directly against HF's single-sequence
+  generate();
+- ForwardOutput carries a single next_tokens (single-machine CPU; no
+  gpu/cpu double buffering or copy_done event).
 
-与 mini-sglang 一致的契约：`forward_batch` 内部对每个 req 调
-`complete_one()`（预支式记账，见 core.Req），采样结果由调用方
-（LLM / 将来的 Scheduler）通过 `append_host` 补回。
+Contract shared with mini-sglang: `forward_batch` calls `complete_one()`
+on each req internally (speculative bookkeeping, see core.Req); the
+sampled tokens are fed back by the caller (LLM / future Scheduler) via
+`append_host`.
 """
 
 from typing import NamedTuple
@@ -32,26 +36,30 @@ from .sample import Sampler
 
 
 class ForwardOutput(NamedTuple):
-    next_tokens: list[int]  # 与 batch.reqs 一一对应
+    next_tokens: list[int]  # one-to-one with batch.reqs
 
 
 class Engine:
     def __init__(self, config: EngineConfig):
         self.config = config
         model_config = Qwen3Config.from_pretrained(config.model_path)
-        # 对齐 mini-sglang 的加载流程：meta 设备 + 默认 dtype 上下文里构造
-        # ——参数是不占内存的占位符，dtype 在构造期一次定死（layer 里裸
-        # torch.empty 跟随全局默认，无需逐个传 dtype）；RoPE 表是常数而非
-        # 权重，例外地建在真实设备上。
+        # Mirrors mini-sglang's loading flow: construct under a meta device
+        # + default-dtype context — parameters are memory-free placeholders,
+        # and dtype is fixed once at construction time (bare torch.empty in
+        # layers follows the global default, no per-layer dtype plumbing);
+        # the RoPE tables are constants, not weights, and are exceptionally
+        # built on the real device.
         set_rope_device("cpu")
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = Qwen3ForCausalLM(model_config)
-        # load_weights 逐参数物化并填充；完整性校验兜底：loader 路径写错
-        # 会静默返回空集合（同 tests/test_load_qwen3.py）。
+        # load_weights materializes and fills each parameter; the
+        # completeness check is a safety net: a wrong loader path silently
+        # returns an empty set (same as tests/test_load_qwen3.py).
         loaded = load_weights(self.model, config.model_path)
         missing = set(self.model.state_dict()) - loaded
-        assert not missing, f"以下参数未被加载: {sorted(missing)}"
-        # 逐参数物化拆开了构造期的 tied 存储，重新共享。
+        assert not missing, f"parameters not loaded: {sorted(missing)}"
+        # Per-parameter materialization breaks the tied storage created at
+        # construction time; re-share it here.
         self.model.tie_weights()
         self.model.eval()
         self.sampler = Sampler()

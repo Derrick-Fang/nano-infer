@@ -14,7 +14,7 @@ def test_from_pretrained_reads_fields(tmp_path):
         "head_dim": 32,
         "vocab_size": 1000,
         "rope_theta": 500000.0,
-        # 其它字段（如 transformers 版本号）应被忽略
+        # unrelated fields (e.g. the transformers version) should be ignored
         "transformers_version": "5.0.0",
     }))
     cfg = Qwen3Config.from_pretrained(tmp_path)

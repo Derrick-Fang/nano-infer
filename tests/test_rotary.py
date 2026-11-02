@@ -30,7 +30,7 @@ def test_rotary_matches_hf():
     positions = torch.arange(seq).unsqueeze(0).expand(batch, -1)
 
     cos_o, sin_o = ours(positions)
-    # HF 的 forward 需要 x 仅为 dtype/device 参考
+    # HF's forward only needs x as a dtype/device reference
     cos_r, sin_r = ref(q, positions)
 
     q_o, k_o = apply_rotary_pos_emb(q, k, cos_o, sin_o)
@@ -41,7 +41,9 @@ def test_rotary_matches_hf():
 
 
 def test_rotary_absolute_positions_for_decode():
-    # decode 场景：单个 token 用其绝对位置查表，结果应等于全序列对应行
+    # decode scenario: a single token looks up the table by its absolute
+    # position; the result must equal the corresponding row of the
+    # full-sequence lookup
     rope = RotaryEmbedding(head_dim=32, max_position_embeddings=128, base=10000.0)
     full_cos, full_sin = rope(torch.arange(10).unsqueeze(0))
     one_cos, one_sin = rope(torch.tensor([[7]]))

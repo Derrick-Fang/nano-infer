@@ -1,11 +1,13 @@
-"""顶层只导出 LLM（对齐 mini-sglang 的 __init__.py）。
+"""Only LLM is exported at the top level (mirrors mini-sglang's __init__.py).
 
-用法：
+Usage:
     from python import LLM
     from python.core import SamplingParams
 
-模型内部组件（Qwen3ForCausalLM 等）不从顶层导出，走 python.model.*——
-顶层保持"离线推理入口"这一个职责，避免 import python 时暴露实现细节。
+Model internals (Qwen3ForCausalLM etc.) are not exported here — they live
+under python.model.*. The top level keeps the single responsibility of
+being the offline inference entry point, so `import python` does not leak
+implementation details.
 """
 
 from python.llm import LLM

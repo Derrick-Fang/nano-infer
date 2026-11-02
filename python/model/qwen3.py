@@ -1,12 +1,15 @@
-"""Qwen3 模型（结构照抄 nano-vllm models/qwen3.py）。
+"""Qwen3 model (structure ported verbatim from nano-vllm models/qwen3.py).
 
-基础组件在 python/layers/ 下（Linear/RMSNorm/RoPE/SiluAndMul/Embed）。
-与 nano-vllm 的差异（学习项目，保持简单）：
-- 无 TP：Parallel 层全部退化为完整权重（见 layers/linear.py）
-- 无 paged attention / KV cache：attention 用
-  F.scaled_dot_product_attention(is_causal=True, enable_gqa=True)，
-  张量保留 [batch, seq, ...] 形状（nano-vllm 是展平的 [num_tokens, ...]）
-- config 用本地 dataclass（nano-vllm 直接用 transformers.Qwen3Config）
+Base components live under python/layers/ (Linear/RMSNorm/RoPE/SiluAndMul/
+Embed). Differences from nano-vllm (learning project — keep it simple):
+- No TP: all Parallel layers degenerate to full weights (see
+  layers/linear.py);
+- No paged attention / KV cache: attention uses
+  F.scaled_dot_product_attention(is_causal=True, enable_gqa=True), and
+  tensors keep [batch, seq, ...] shapes (nano-vllm flattens to
+  [num_tokens, ...]);
+- config is a local dataclass (nano-vllm uses transformers.Qwen3Config
+  directly).
 """
 
 from __future__ import annotations
@@ -22,9 +25,10 @@ from torch import nn
 from python.layers.activation import SiluAndMul
 from python.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from python.layers.layernorm import RMSNorm
-# 暂时全部用 ReplicatedLinear（最简单的一版）；packed 切片逻辑因此
-# 留在 loader.py。之后换回 QKVParallel/MergedColumnParallel/RowParallel
-# 时，切片逻辑会随 weight_loader 下沉回各 Linear 层。
+# ReplicatedLinear everywhere for now (the simplest version); the packed
+# slicing logic therefore stays in loader.py. When we switch back to
+# QKVParallel/MergedColumnParallel/RowParallel, slicing moves back down
+# into each Linear layer's weight_loader.
 from python.layers.linear import ReplicatedLinear
 from python.layers.rotary_embedding import apply_rotary_pos_emb, get_rope
 
@@ -36,7 +40,8 @@ from python.layers.rotary_embedding import apply_rotary_pos_emb, get_rope
 
 @dataclass
 class Qwen3Config:
-    """直接解析 HF config.json，只保留 forward 需要的字段。"""
+    """Parses HF config.json directly, keeping only the fields forward
+    needs."""
 
     vocab_size: int = 151936
     hidden_size: int = 1024
@@ -50,14 +55,14 @@ class Qwen3Config:
     rope_theta: float = 1_000_000.0
     rms_norm_eps: float = 1e-6
     tie_word_embeddings: bool = True
-    attention_bias: bool = False  # Qwen3 去掉了 Qwen2 的 qkv bias
+    attention_bias: bool = False  # Qwen3 dropped Qwen2's qkv bias
 
     @classmethod
     def from_pretrained(cls, model_path: str | Path) -> "Qwen3Config":
         config_file = Path(model_path) / "config.json"
         with open(config_file) as f:
             data = json.load(f)
-        # head_dim 缺省时退回 hidden_size / num_attention_heads
+        # head_dim falls back to hidden_size / num_attention_heads when absent
         data.setdefault("head_dim", data["hidden_size"] // data["num_attention_heads"])
         field_names = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in data.items() if k in field_names})
@@ -69,11 +74,11 @@ class Qwen3Config:
 
 
 class Qwen3Attention(nn.Module):
-    """GQA attention（naive）：packed qkv_proj -> QK-Norm -> RoPE -> SDPA -> o_proj。
+    """GQA attention (naive): packed qkv_proj -> QK-Norm -> RoPE -> SDPA -> o_proj.
 
-    qkv_proj.weight = [q; k; v]（行数 = q_size, kv_size, kv_size），
-    切片逻辑在 QKVParallelLinear.weight_loader 里。
-    QK-Norm 是 Qwen3 相对 Qwen2 的新增：对 q/k 做 per-head RMSNorm。
+    qkv_proj.weight = [q; k; v] (row counts = q_size, kv_size, kv_size);
+    the slicing logic lives in QKVParallelLinear.weight_loader.
+    QK-Norm is Qwen3's addition over Qwen2: per-head RMSNorm on q/k.
     """
 
     def __init__(self, config: Qwen3Config):
@@ -105,23 +110,25 @@ class Qwen3Attention(nn.Module):
         q, k, v = self.qkv_proj(hidden_states).split(
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
-        # reshape 成 [batch, heads, seq, head_dim]，QK-Norm 作用在 head_dim 上
+        # reshape to [batch, heads, seq, head_dim]; QK-Norm acts on head_dim
         q = self.q_norm(q.view(batch, seq, self.num_heads, self.head_dim)).transpose(1, 2)
         k = self.k_norm(k.view(batch, seq, self.num_kv_heads, self.head_dim)).transpose(1, 2)
         v = v.view(batch, seq, self.num_kv_heads, self.head_dim).transpose(1, 2)
         cos, sin = self.rotary_emb(positions)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        # enable_gqa: k/v 自动按组 repeat 到 q 的头数，无需手动 repeat_kv
+        # enable_gqa: k/v are repeated to q's head count automatically, no
+        # manual repeat_kv needed
         o = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         return self.o_proj(o.transpose(1, 2).reshape(batch, seq, self.q_size))
 
 
 class Qwen3MLP(nn.Module):
-    """SwiGLU：down_proj(silu(gate) * up)，gate/up 打包进 gate_up_proj。"""
+    """SwiGLU: down_proj(silu(gate) * up); gate/up are packed into
+    gate_up_proj."""
 
     def __init__(self, config: Qwen3Config):
         super().__init__()
-        assert config.hidden_act == "silu", f"未支持的激活函数: {config.hidden_act}"
+        assert config.hidden_act == "silu", f"unsupported activation: {config.hidden_act}"
         self.gate_up_proj = ReplicatedLinear(
             config.hidden_size, 2 * config.intermediate_size, bias=False
         )
@@ -135,7 +142,8 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
-    """pre-norm；残差流经 RMSNorm 的 add_rms_forward 隐式传递（照抄 nano-vllm）。"""
+    """pre-norm; the residual stream is threaded implicitly through
+    RMSNorm's add_rms_forward (verbatim from nano-vllm)."""
 
     def __init__(self, config: Qwen3Config):
         super().__init__()
@@ -185,10 +193,12 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(nn.Module):
-    """checkpoint key -> packed 参数 的映射（loader.py 使用）。
+    """Mapping from checkpoint keys to packed parameters (used by
+    loader.py).
 
-    shard id 标识源权重写入 packed 参数的哪一段，切片逻辑在各
-    Parallel Linear 的 weight_loader 里。
+    The shard id identifies which segment of the packed parameter a source
+    weight writes into; the slicing logic lives in each Parallel Linear's
+    weight_loader.
     """
 
     packed_modules_mapping = {
@@ -207,10 +217,12 @@ class Qwen3ForCausalLM(nn.Module):
         self.tie_weights()
 
     def tie_weights(self) -> None:
-        """lm_head 与 embed_tokens 共享存储（HF 同名约定）。
+        """lm_head and embed_tokens share storage (HF's same-named
+        convention).
 
-        meta 构造 + loader 逐参数物化会把共享拆开（各自落成独立存储），
-        因此加载权重后必须重新调用本方法。"""
+        Meta construction + per-parameter materialization in the loader
+        breaks the sharing (each lands in independent storage), so this
+        method must be called again after loading weights."""
         if self.config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 

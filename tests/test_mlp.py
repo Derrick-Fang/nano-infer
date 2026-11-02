@@ -6,9 +6,11 @@ from python.model.qwen3 import Qwen3Config, Qwen3MLP
 
 
 def test_mlp_matches_hf_with_packed_weights():
-    """验证 packed 约定：gate_up_proj.weight = [gate_proj.weight; up_proj.weight]。
+    """Verifies the packing convention: gate_up_proj.weight =
+    [gate_proj.weight; up_proj.weight].
 
-    这正是后续权重加载器要做的拼接，这里用 HF 参考实现反向验证数值。
+    This is exactly the concatenation the weight loader will perform; here
+    we validate the numerics backwards against the HF reference.
     """
     torch.manual_seed(0)
     hidden, inter = 64, 128
@@ -19,7 +21,7 @@ def test_mlp_matches_hf_with_packed_weights():
         ref.gate_proj.weight.copy_(torch.randn_like(ref.gate_proj.weight))
         ref.up_proj.weight.copy_(torch.randn_like(ref.up_proj.weight))
         ref.down_proj.weight.copy_(torch.randn_like(ref.down_proj.weight))
-        # 打包：前半 gate，后半 up
+        # pack: first half gate, second half up
         ours.gate_up_proj.weight.copy_(
             torch.cat([ref.gate_proj.weight, ref.up_proj.weight], dim=0)
         )

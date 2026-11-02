@@ -1,21 +1,27 @@
-"""把 HF safetensors 权重写入 packed 模型。
+"""Writes HF safetensors weights into the packed model.
 
-"checkpoint 布局 -> 模型布局" 的适配层：
-- 未打包的权重：按名字对号入座，走参数的 weight_loader（缺省直接 copy_）
-- 打包的权重（q/k/v_proj -> qkv_proj，gate/up_proj -> gate_up_proj）：
-  按 packed_modules_mapping 改写参数名，按 shard 的行区间切片写入
+The adaptation layer between "checkpoint layout" and "model layout":
+- unpacked weights: matched by name, written through each parameter's
+  weight_loader (defaulting to a plain copy_);
+- packed weights (q/k/v_proj -> qkv_proj, gate/up_proj -> gate_up_proj):
+  the parameter name is rewritten per packed_modules_mapping, and the
+  shard's row range is sliced in.
 
-注意：当前模型全部使用 ReplicatedLinear（不会自己切分片），所以 packed
-切片暂时在这里做；换回 QKVParallelLinear / MergedColumnParallelLinear
-后，切片逻辑会随 weight_loader 下沉回各 Linear 层，本文件可恢复成
-nano-vllm 那样的纯调度。
+Note: the model currently uses ReplicatedLinear everywhere (which does no
+sharding of its own), so packed slicing lives here for now; once we switch
+back to QKVParallelLinear / MergedColumnParallelLinear, the slicing logic
+moves back down into each Linear layer's weight_loader, and this file can
+return to being a pure dispatcher like nano-vllm's.
 
-返回成功写入的参数名集合，供测试做完整性校验
-（loaded == model.state_dict().keys() 才算一个不漏）。
+Returns the set of parameter names successfully written, so tests can
+verify completeness (loaded == model.state_dict().keys() means nothing
+was missed).
 
-支持 mini-sglang 风格的 meta 构造：模型在 `with torch.device("meta")`
-下创建时参数只是不占内存的占位符，本函数在首次写入前将其物化
-（_materialize），dtype 沿用构造期定下的值（见 python/utils.torch_dtype）。
+Supports mini-sglang-style meta construction: when the model is created
+under `with torch.device("meta")`, parameters are memory-free
+placeholders; this function materializes them before the first write
+(_materialize), keeping the dtype fixed at construction time (see
+python/utils.torch_dtype).
 """
 
 from pathlib import Path
@@ -30,13 +36,16 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 
 def _materialize(model: nn.Module, device: torch.device) -> None:
-    """把 meta 设备上的参数整体落成真实存储（保留构造期定下的 shape/dtype）。
+    """Materializes meta-device parameters into real storage (keeping the
+    shape/dtype fixed at construction time).
 
-    注意不能直接 `param.data = cpu_tensor`——Variable.set_data 拒绝跨
-    tensor 类型（meta vs dense），只能整个替换 Parameter 对象，并把挂在
-    旧对象上的 weight_loader 钩子搬到新对象上。
-    副作用：tied 参数（lm_head/embed_tokens）会被拆成独立存储，加载后
-    需调用 model.tie_weights() 重新共享。非 meta 模型本函数是 no-op。
+    Note that `param.data = cpu_tensor` does not work — Variable.set_data
+    rejects crossing tensor types (meta vs dense); the whole Parameter
+    object must be replaced, and the weight_loader hook attached to the
+    old object carried over to the new one.
+    Side effect: tied parameters (lm_head/embed_tokens) are split into
+    independent storage, so model.tie_weights() must be called after
+    loading to re-share them. On a non-meta model this is a no-op.
     """
     for module in model.modules():
         for name, param in module._parameters.items():
@@ -60,7 +69,7 @@ def load_weights(
     q_size = config.num_attention_heads * config.head_dim
     kv_size = config.num_key_value_heads * config.head_dim
     inter = config.intermediate_size
-    # packed 参数内部的行区间：packed 名 -> shard id -> (start, end)
+    # Row ranges inside packed parameters: packed name -> shard id -> (start, end)
     shard_spans = {
         "qkv_proj": {
             "q": (0, q_size),
@@ -71,7 +80,7 @@ def load_weights(
     }
     packed = model.packed_modules_mapping
     loaded = set()
-    # glob 兼容单文件与 model-0000N-of-XXXXX 分片两种 checkpoint
+    # glob handles both a single file and model-0000N-of-XXXXX shards
     for file in sorted(Path(model_path).glob("*.safetensors")):
         with safe_open(file, framework="pt", device="cpu") as f:
             for weight_name in f.keys():

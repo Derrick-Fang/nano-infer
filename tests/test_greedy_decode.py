@@ -1,9 +1,12 @@
-"""Golden test：greedy 解码输出逐 token 对齐 HF generate()。
+"""Golden test: greedy decoding output must match HF generate() token by
+token.
 
-这是 AGENT.md 规定的最高正确性标准。naive engine（无 KV cache、逐 req
-全量重算）下，batch 内各请求互不影响，因此 HF 参考用 batch=1 逐条生成
-（避免 HF batched generate 的 padding 引入额外变量），我们侧则用一次
-LLM.generate 混合批跑——同时验证了连续批处理下每条输出不变。
+This is the highest correctness bar defined by AGENT.md. Under the naive
+engine (no KV cache, full recompute per req), requests in a batch cannot
+affect each other, so the HF reference generates one sequence at a time
+with batch=1 (avoiding the extra variable of padding in HF batched
+generate), while our side runs a mixed batch in a single LLM.generate —
+which also verifies that continuous batching leaves each output unchanged.
 """
 
 from pathlib import Path
@@ -18,7 +21,7 @@ MODEL_PATH = Path(__file__).parent.parent.parent / "data" / "Qwen3-0.6B"
 
 needs_model = pytest.mark.skipif(
     not (MODEL_PATH / "model.safetensors").exists(),
-    reason=f"本地权重不存在: {MODEL_PATH}",
+    reason=f"local weights not found: {MODEL_PATH}",
 )
 
 PROMPTS = [
@@ -59,7 +62,8 @@ def hf_greedy(hf, prompt: str, max_new_tokens: int) -> list[int]:
 
 @needs_model
 def test_greedy_matches_hf_batched(llm, hf):
-    """一次 generate 混入多个 prompt：每条输出都必须与 HF 单条 greedy 一致。"""
+    """Multiple prompts in one generate call: each output must match HF's
+    single-sequence greedy result."""
     results = llm.generate(PROMPTS, SamplingParams(max_tokens=MAX_NEW_TOKENS))
     for prompt, res in zip(PROMPTS, results):
         ref = hf_greedy(hf, prompt, MAX_NEW_TOKENS)
@@ -71,7 +75,7 @@ def test_greedy_matches_hf_batched(llm, hf):
 
 @needs_model
 def test_greedy_single_prompt(llm, hf):
-    """单请求最短路径（Prefill 一步 + 逐步 decode）。"""
+    """Single-request shortest path (one prefill step + stepwise decode)."""
     prompt = "The capital of France is"
     [res] = llm.generate([prompt], SamplingParams(max_tokens=8))
     assert res["token_ids"] == hf_greedy(hf, prompt, 8)
