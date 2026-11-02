@@ -157,7 +157,11 @@ python/
   - `python/kvcache/allocator.py`（TokenToKVPoolAllocator，合并 sglang
     的 token/paged 两个 allocator：free_pages + staged_pages[need_sort]
     free list，alloc/alloc_extend/alloc_decode 与 free/free_page_ids/
-    free_segment(s) 接口，单请求标量 API 代替 batched Triton kernel）。
+    free_segment(s) 接口，单请求标量 API 代替 batched Triton kernel）；
+  - `python/kvcache/base.py` + `mha_pool.py`（BaseKVPool/MHAKVPool，
+    按 token slot 读写的 KV 存储，对应 mini-sglang 的
+    BaseKVCachePool/MHAKVCache：buffer 为 [2, L, S, H, D] 扁平布局，
+    read/write 带可选 layer_id，k_cache/v_cache 提供层视图）。
 - **R5 采样完整化**：temperature / top_k / top_p（`BatchSamplingArgs`），
   种子处理。
 - **R6（可选）** attention backend 抽象与全局 `Context`：只有当
