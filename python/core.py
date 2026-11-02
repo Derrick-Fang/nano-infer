@@ -1,4 +1,4 @@
-"""核心数据结构：SamplingParams / Req（Batch 随后引入）。
+"""核心数据结构：SamplingParams / Req / Batch。
 
 对齐 mini-sglang 的 `minisgl/core.py`，是 runtime 各组件（scheduler、
 engine、kvcache）之间传递的基本类型。
@@ -8,10 +8,13 @@ engine、kvcache）之间传递的基本类型。
   之前没有设备侧 token 存储，list 更简单；
 - 暂不搬运 `table_idx` / `cache_handle` 字段——它们属于 KV 阶段（R4 的
   TableManager / CacheManager 引入时再加）；
-- `Batch` / `Context` 本阶段不搬运。
+- `Batch` 暂不搬运 `input_ids/positions/out_loc/padded_reqs/attn_metadata`
+  等由 scheduler/attention backend 填充的字段（R3/R4 再加）；
+- `Context`（全局上下文）本阶段不搬运，R6 视需要引入。
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass
@@ -84,3 +87,27 @@ class Req:
             f"cached_len={self.cached_len}, device_len={self.device_len}, "
             f"max_device_len={self.max_device_len})"
         )
+
+
+@dataclass
+class Batch:
+    """一次前向的最小调度单位：一组同阶段的 Req。
+
+    phase 用字符串字面量而非枚举（对齐 mini-sglang），prefill 与 decode
+    永远不会混在同一个 Batch 里——这是调度器（R3）维持的不变式。
+    """
+
+    reqs: list[Req]
+    phase: Literal["prefill", "decode"]
+
+    @property
+    def is_prefill(self) -> bool:
+        return self.phase == "prefill"
+
+    @property
+    def is_decode(self) -> bool:
+        return self.phase == "decode"
+
+    @property
+    def size(self) -> int:
+        return len(self.reqs)

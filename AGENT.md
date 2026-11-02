@@ -130,14 +130,14 @@ python/
 
 ### 分阶段实施路线（offline）
 
-- **R1 `core.py`**（进行中）：`SamplingParams` / `Req` 已落地（含纯逻辑
-  测试，`python/engine/request.py` 已删除）；`Batch` 在 R2 引入 Engine
-  时一并搬运。Req 存 `list[int]`，长度记账用
-  cached_len/device_len/max_device_len 三整数。
-- **R2 naive Engine + 离线入口**：`Engine.forward_batch` 无 KV cache、
-  全量重算；`Sampler` 只支持 greedy（`is_greedy` 断言）；`llm.py` 的
-  `LLM.generate()` 走"单请求 prefill → 逐步 decode"的最短路径。
-  **golden test：greedy 输出逐 token 对齐 HF `generate()`。**
+- **R1 `core.py`（已完成）**：`SamplingParams` / `Req` / `Batch` +
+  纯逻辑测试；`python/engine/request.py` 已删除。Req 存 `list[int]`，
+  长度记账用 cached_len/device_len/max_device_len 三整数。
+- **R2 naive Engine + 离线入口（已完成）**：`Engine.forward_batch`
+  无 KV cache、逐 req 全量重算；`Sampler` 只支持 greedy（LLM 入口断言
+  `is_greedy`）；`llm.py` 的 `LLM.generate()` 走"全体 prefill → 逐步
+  decode"最短路径。**golden test 已通过：混合 batch 的 greedy 输出
+  逐 token 对齐 HF `generate()`（`tests/test_greedy_decode.py`）。**
 - **R3 Scheduler + 连续批处理**：`PrefillManager` / `DecodeManager` /
   `PendingReq` / `Scheduler.normal_loop`（同步：schedule → forward →
   process，无 overlap）。准入先只受 `max_running_req` 限制（无内存约束，

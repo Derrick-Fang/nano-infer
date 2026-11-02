@@ -2,7 +2,7 @@
 
 import pytest
 
-from python.core import Req, SamplingParams
+from python.core import Batch, Req, SamplingParams
 
 
 def make_req(prompt=(10, 20, 30), max_tokens=5, **kwargs) -> Req:
@@ -76,3 +76,12 @@ def test_is_greedy():
 
 def test_repr():
     assert "uid=0" in repr(make_req())
+
+
+def test_batch_phase():
+    reqs = [make_req(uid=0), make_req(uid=1)]
+    prefill = Batch(reqs=reqs, phase="prefill")
+    assert prefill.is_prefill and not prefill.is_decode
+    assert prefill.size == 2
+    decode = Batch(reqs=reqs, phase="decode")
+    assert decode.is_decode and not decode.is_prefill
