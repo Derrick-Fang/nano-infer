@@ -84,13 +84,38 @@ def test_logits_match_hf(our_model):
     hf_model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=torch.float32).eval()
 
     input_ids = tokenizer("The capital of France is", return_tensors="pt").input_ids
-    positions = torch.arange(input_ids.shape[1]).unsqueeze(0)
+    positions = torch.arange(input_ids.shape[1])
+
+    # Single-request prefill against a freshly allocated pool: out_loc is
+    # just the first seq_len slots, and cu_seqlens_q == cu_seqlens_k.
+    from python.engine.metadata import AttnMetadata
+    from python.kvcache import MHAKVCache
+
+    cfg = our_model.config
+    seq_len = input_ids.shape[1]
+    kv_cache = MHAKVCache(
+        num_layers=cfg.num_hidden_layers,
+        num_kv_heads=cfg.num_key_value_heads,
+        head_dim=cfg.head_dim,
+        num_slots=seq_len,
+        dtype=next(our_model.parameters()).dtype,
+    )
+    metadata = AttnMetadata(
+        cu_seqlens_q=torch.tensor([0, seq_len]),
+        cu_seqlens_k=torch.tensor([0, seq_len]),
+        cache_seqlens=torch.tensor([seq_len]),
+        max_seqlen_k=seq_len,
+        page_table=torch.arange(seq_len).unsqueeze(0),
+    )
 
     with torch.no_grad():
-        ours = our_model.compute_logits(our_model(input_ids, positions))
+        hidden = our_model(
+            input_ids[0], positions, kv_cache, torch.arange(seq_len), metadata
+        )
+        ours = our_model.compute_logits(hidden)
         ref = hf_model(input_ids).logits
 
-    assert ours.shape == ref.shape
-    torch.testing.assert_close(ours, ref, rtol=1e-3, atol=1e-3)
+    assert ours.shape == (seq_len, ref.shape[-1])
+    torch.testing.assert_close(ours, ref[0], rtol=1e-3, atol=1e-3)
     # same greedy next token
-    assert ours[0, -1].argmax().item() == ref[0, -1].argmax().item()
+    assert ours[-1].argmax().item() == ref[0, -1].argmax().item()

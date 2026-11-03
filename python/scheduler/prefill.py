@@ -1,20 +1,16 @@
 """PrefillManager + PrefillAdder: admission of new requests and assembly
 of prefill batches.
 
-Mirrors mini-sglang's `scheduler/prefill.py`, simplified for R3 (no KV
-cache):
+Mirrors mini-sglang's `scheduler/prefill.py`, simplified:
 
-- mini-sglang's admission is bounded by three kinds of resources:
-  page_table rows (TableManager), KV-cache pages (CacheManager), and the
-  token budget (chunked prefill). R3 has no KV cache, so the first two
-  degenerate to a single integer `max_running_req` (PrefillManager
-  converts it into this batch's free slots using DecodeManager's running
-  count);
-- the token budget (`max_extend_tokens`) is kept, but R3 has no
-  `ChunkedReq`, so an over-long prompt cannot be split across prefill
-  rounds — a single request exceeding the whole budget is admitted whole
-  if it is the first of the batch (otherwise it could never be
-  scheduled); splitting is left to R4;
+- admission is bounded by three kinds of resources, mirroring
+  mini-sglang: ReqToTokenPool rows (min'ed into this batch's free slots),
+  KV-pool tokens (CacheManager.available_kv_tokens, min'ed into the token
+  budget), and the prefill token budget `max_extend_tokens`;
+- the token budget is kept, but there is no `ChunkedReq` yet, so an
+  over-long prompt cannot be split across prefill rounds — a single
+  request exceeding the whole budget is admitted whole if it is the first
+  of the batch (otherwise it could never be scheduled);
 - no prefix-cache matching: `cached_len` is always 0 and extend_len is
   the full prompt length.
 """
@@ -23,6 +19,7 @@ from dataclasses import dataclass, field
 
 from python.core import Batch, Req
 
+from .cache import CacheManager
 from .decode import DecodeManager
 from .utils import PendingReq
 
@@ -69,6 +66,7 @@ class PrefillManager:
 
     max_running_req: int
     decode_manager: DecodeManager
+    cache_manager: CacheManager
     pending_list: list[PendingReq] = field(default_factory=list)
 
     def add_one_req(self, req: PendingReq) -> None:
@@ -78,8 +76,14 @@ class PrefillManager:
         if not self.pending_list:
             return None
         adder = PrefillAdder(
-            token_budget=prefill_budget,
-            max_new_reqs=self.max_running_req - len(self.decode_manager.running_reqs),
+            # The KV pool's free tokens bound what this round may admit
+            # (exact at page_size=1); running requests' future decode
+            # growth is not reserved yet (inflight_tokens, R4 follow-up).
+            token_budget=min(prefill_budget, self.cache_manager.available_kv_tokens),
+            max_new_reqs=min(
+                self.max_running_req - len(self.decode_manager.running_reqs),
+                self.cache_manager.available_rows,
+            ),
         )
         reqs: list[Req] = []
         for pending_req in self.pending_list:

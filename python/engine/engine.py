@@ -1,19 +1,14 @@
 """Engine: the model executor.
 
-Mirrors mini-sglang's `engine/engine.py`: holds the model and the sampler,
-and exposes only `forward_batch(batch) -> ForwardOutput`.
+Mirrors mini-sglang's `engine/engine.py`: holds the model, the KV pool
+and the sampler, and exposes only `forward_batch(batch) -> ForwardOutput`.
 
-Intentional simplifications of the naive version (R2):
-- **No KV cache**: every step recomputes each req over its full input_ids —
-  correctness first;
-- **Per-req loop** instead of a true batched forward — mini-sglang flattens
-  all reqs' tokens into a single forward, which depends on KV-cache out_loc
-  writes and attention-backend metadata (R4). Running req by req for now
-  guarantees the requests in a batch cannot affect each other, so the
-  golden test can be compared directly against HF's single-sequence
-  generate();
-- ForwardOutput carries a single next_tokens (single-machine CPU; no
-  gpu/cpu double buffering or copy_done event).
+One flattened forward per batch (R4 layout): all requests' tokens are
+concatenated into a single [total_tokens] stream, written to/read from
+the KV pool by out_loc slots, with request boundaries expressed by
+batch.attn_metadata (mirroring mini-sglang's attention backends). What a
+paged-attention kernel would do is spelled out as a per-request SDPA
+loop inside Qwen3Attention (AGENT.md: torch-only dependencies).
 
 Contract shared with mini-sglang: `forward_batch` calls `complete_one()`
 on each req internally (speculative bookkeeping, see core.Req); the
@@ -26,6 +21,7 @@ from typing import NamedTuple
 import torch
 
 from python.core import Batch
+from python.kvcache import MHAKVCache
 from python.layers.rotary_embedding import set_rope_device
 from python.model.loader import load_weights
 from python.model.qwen3 import Qwen3Config, Qwen3ForCausalLM
@@ -62,16 +58,42 @@ class Engine:
         # construction time; re-share it here.
         self.model.tie_weights()
         self.model.eval()
+        self.kv_cache = MHAKVCache(
+            num_layers=model_config.num_hidden_layers,
+            num_kv_heads=model_config.num_key_value_heads,
+            head_dim=model_config.head_dim,
+            num_slots=config.kv_pool_size,
+            dtype=config.dtype,
+            device="cpu",
+        )
         self.sampler = Sampler()
 
     @torch.inference_mode()
     def forward_batch(self, batch: Batch) -> ForwardOutput:
-        last_logits = []
-        for req in batch.reqs:
-            input_ids = torch.tensor([req.input_ids], dtype=torch.long)
-            positions = torch.arange(input_ids.shape[1]).unsqueeze(0)
-            hidden = self.model(input_ids, positions)
-            last_logits.append(self.model.compute_logits(hidden)[0, -1])
+        assert batch.out_loc is not None and batch.attn_metadata is not None, (
+            "Batch must carry out_loc + attn_metadata (filled by the "
+            "scheduler's CacheManager after allocation)"
+        )
+        reqs = batch.reqs
+        # Flatten the batch: each request contributes the tokens it
+        # forwards this step — [cached_len, device_len) for prefill, the
+        # single last token for decode.
+        input_ids = torch.tensor(
+            [tok for req in reqs for tok in req.input_ids[req.cached_len : req.device_len]],
+            dtype=torch.long,
+        )
+        positions = torch.cat(
+            [torch.arange(req.cached_len, req.device_len, dtype=torch.long) for req in reqs]
+        )
+        hidden = self.model(
+            input_ids, positions, self.kv_cache, batch.out_loc, batch.attn_metadata
+        )
+        # Only each request's last position feeds the sampler (mini-sglang
+        # reads the same indices via metadata.get_last_indices).
+        last_logits = self.model.compute_logits(
+            hidden[batch.attn_metadata.get_last_indices()]
+        )
+        next_tokens = self.sampler.sample(last_logits)
+        for req in reqs:
             req.complete_one()
-        next_tokens = self.sampler.sample(torch.stack(last_logits))
         return ForwardOutput(next_tokens=next_tokens.tolist())

@@ -12,10 +12,12 @@ intentional deviations:
 - **No overlap**: only the fully synchronous `normal_loop` — schedule →
   forward → process complete in order before the next round (streams and
   events are meaningless on CPU).
-- **No KV cache**: no TableManager/CacheManager, hence no
-  _free_req_resources / cache_req; clamping max_tokens against
-  max_seq_len is deferred together with EngineConfig.max_seq_len (no such
-  field yet).
+- The CacheManager owns the KV-cache trio (ReqToTokenPool +
+  TokenToKVPoolAllocator; the MHAKVCache pool itself lives in the
+  Engine). Scheduling a batch is immediately followed by allocation:
+  out_loc + attn_metadata are attached to the Batch before forward, and
+  finished requests are released via cache_req (mini-sglang's
+  _free_req_resources).
 - The tokenizer is held by the Scheduler (mirrors mini-sglang) for eos
   detection; LLM, as a subclass, reuses it for encode/decode.
 """
@@ -25,6 +27,7 @@ from transformers import AutoTokenizer
 from python.core import Batch, Req
 from python.engine import Engine, ForwardOutput
 
+from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .prefill import PrefillManager
@@ -33,9 +36,18 @@ from .utils import PendingReq
 
 class Scheduler:
     def __init__(self, config: SchedulerConfig):
+        self.config = config
         self.engine = Engine(config)
+        self.cache_manager = CacheManager(
+            max_running_req=config.max_running_req,
+            max_context_len=config.max_seq_len,
+            kv_pool_size=config.kv_pool_size,
+            page_size=config.page_size,
+        )
         self.decode_manager = DecodeManager()
-        self.prefill_manager = PrefillManager(config.max_running_req, self.decode_manager)
+        self.prefill_manager = PrefillManager(
+            config.max_running_req, self.decode_manager, self.cache_manager
+        )
         self.prefill_budget = config.max_extend_tokens
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_path)
@@ -50,6 +62,13 @@ class Scheduler:
     def add_request(self, req: PendingReq) -> None:
         """Entry point for new requests; corresponds to the UserMsg branch
         of mini-sglang's `_process_one_msg`."""
+        # Clamp max_tokens so prompt + output always fits one ReqToTokenPool
+        # row (mini-sglang clamps against max_seq_len the same way).
+        sp = req.sampling_params
+        assert req.input_len < self.config.max_seq_len, (
+            f"prompt length {req.input_len} exceeds max_seq_len {self.config.max_seq_len}"
+        )
+        sp.max_tokens = min(sp.max_tokens, self.config.max_seq_len - req.input_len)
         self.prefill_manager.add_one_req(req)
 
     @property
@@ -74,10 +93,31 @@ class Scheduler:
     def _schedule_next_batch(self) -> Batch | None:
         # Prefill takes priority over decode (mirrors mini-sglang;
         # decode-first is a TODO there too).
-        return (
+        batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
+        if batch is None:
+            return None
+        # Allocation follows scheduling immediately (synchronous loop):
+        # out_loc + attn_metadata must be attached before forward.
+        if batch.is_prefill:
+            out_loc = self.cache_manager.allocate_paged(batch.reqs)
+        else:
+            out_loc = self.cache_manager.allocate_decode(batch.reqs)
+        if out_loc is None:
+            # Admission is supposed to prevent this for prefill; decode can
+            # still run dry because in-flight growth is not reserved yet
+            # (inflight_tokens admission arrives with ChunkedReq).
+            raise RuntimeError(
+                f"KV pool exhausted while scheduling a {batch.phase} batch "
+                f"of {batch.size} reqs; raise kv_pool_size or lower "
+                "max_running_req (proper in-flight admission is an R4 "
+                "follow-up)"
+            )
+        batch.out_loc = out_loc
+        batch.attn_metadata = self.cache_manager.build_metadata(batch.reqs)
+        return batch
 
     def _process_last_data(self, batch: Batch, output: ForwardOutput) -> None:
         """Stop conditions (eos / max_tokens) are checked here, mirroring
@@ -89,4 +129,5 @@ class Scheduler:
             )
             if finished:
                 self.decode_manager.remove_req(req)
+                self.cache_manager.cache_req(req)
                 self.finished_reqs.append(req)

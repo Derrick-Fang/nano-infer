@@ -6,18 +6,20 @@ between the runtime components (scheduler, engine, kvcache).
 Intentional deviations from mini-sglang (declared in AGENT.md "Runtime
 Design"):
 - `Req.input_ids` is a `list[int]` instead of a host tensor — there is no
-  device-side token storage until token_pool arrives (R4), and a list is
+  device-side token storage until token_pool arrives, and a list is
   simpler;
-- `table_idx` / `cache_handle` are not ported yet — they belong to the KV
-  cache stage (added when R4 introduces TableManager / CacheManager);
-- `Batch` does not yet carry `input_ids/positions/out_loc/padded_reqs/
-  attn_metadata`, which are filled by the scheduler/attention backend
-  (added in R3/R4);
+- `cache_handle` is not ported — it belongs to the radix prefix cache,
+  which this project does not have;
 - `Context` (global context) is not ported at this stage; R6 will decide.
 """
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+import torch
+
+if TYPE_CHECKING:
+    from python.engine.metadata import AttnMetadata
 
 
 @dataclass
@@ -51,10 +53,14 @@ class Req:
     """
 
     input_ids: list[int]  # prompt + generated tokens; append-only
-    cached_len: int  # tokens already forwarded (with KV); bookkeeping only while there is no KV cache
+    cached_len: int  # tokens already forwarded (with KV in the pool)
     output_len: int  # max tokens allowed to generate (= sampling_params.max_tokens)
     uid: int
     sampling_params: SamplingParams
+    # Row index into ReqToTokenPool, assigned by CacheManager.allocate_paged
+    # at admission and released by cache_req at finish; None while the
+    # request owns no row.
+    table_idx: int | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids, "prompt must not be empty"
@@ -105,11 +111,19 @@ class Batch:
 
     phase is a string literal rather than an enum (mirrors mini-sglang);
     prefill and decode never mix in the same Batch — an invariant
-    maintained by the scheduler (R3).
+    maintained by the scheduler.
+
+    out_loc / attn_metadata are filled by the scheduler's CacheManager
+    right after scheduling (allocation must precede metadata assembly);
+    the Engine requires them to be set before forward.
     """
 
     reqs: list[Req]
     phase: Literal["prefill", "decode"]
+    # Flattened pool locations this step's tokens write KV to,
+    # [total_tokens] int64; one entry per forwarded token.
+    out_loc: torch.Tensor | None = None
+    attn_metadata: "AttnMetadata | None" = None
 
     @property
     def is_prefill(self) -> bool:

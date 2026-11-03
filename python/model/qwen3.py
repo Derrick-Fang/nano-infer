@@ -4,10 +4,11 @@ Base components live under python/layers/ (Linear/RMSNorm/RoPE/SiluAndMul/
 Embed). Differences from nano-vllm (learning project — keep it simple):
 - No TP: all Parallel layers degenerate to full weights (see
   layers/linear.py);
-- No paged attention / KV cache: attention uses
-  F.scaled_dot_product_attention(is_causal=True, enable_gqa=True), and
-  tensors keep [batch, seq, ...] shapes (nano-vllm flattens to
-  [num_tokens, ...]);
+- No paged-attention kernel: attention writes/reads the KV pool by
+  out_loc slots (mirroring mini-sglang's backend contract) but computes
+  with a per-request F.scaled_dot_product_attention loop instead of
+  flash_attn_with_kvcache; tensors use the flattened [total_tokens, ...]
+  layout, request boundaries expressed by AttnMetadata;
 - config is a local dataclass (nano-vllm uses transformers.Qwen3Config
   directly).
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -30,7 +32,13 @@ from python.layers.layernorm import RMSNorm
 # QKVParallel/MergedColumnParallel/RowParallel, slicing moves back down
 # into each Linear layer's weight_loader.
 from python.layers.linear import ReplicatedLinear
+from python.kvcache import BaseKVCachePool
 from python.layers.rotary_embedding import apply_rotary_pos_emb, get_rope
+
+if TYPE_CHECKING:
+    # TYPE_CHECKING only: importing python.engine.metadata at runtime would
+    # trigger python/engine/__init__ -> engine.py -> this module (circular).
+    from python.engine.metadata import AttnMetadata
 
 
 # ---------------------------------------------------------------------------
@@ -74,15 +82,27 @@ class Qwen3Config:
 
 
 class Qwen3Attention(nn.Module):
-    """GQA attention (naive): packed qkv_proj -> QK-Norm -> RoPE -> SDPA -> o_proj.
+    """GQA attention over the KV pool: packed qkv_proj -> QK-Norm -> RoPE
+    -> write pool at out_loc -> per-request SDPA against gathered pool KV
+    -> o_proj.
+
+    Follows the mini-sglang attention-backend contract (attention/fa.py):
+    the forward first stores this layer's k/v into the pool at out_loc,
+    then attends against the pool contents addressed by AttnMetadata —
+    prefill and decode share the same code path (decode is q_len == 1).
+    In place of flash_attn_with_kvcache we run a per-request SDPA loop
+    (AGENT.md: torch-only dependencies, clarity over cleverness); the
+    metadata contract is unchanged, so a real varlen kernel could drop in
+    without touching anything outside this method.
 
     qkv_proj.weight = [q; k; v] (row counts = q_size, kv_size, kv_size);
     the slicing logic lives in QKVParallelLinear.weight_loader.
     QK-Norm is Qwen3's addition over Qwen2: per-head RMSNorm on q/k.
     """
 
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3Config, layer_id: int):
         super().__init__()
+        self.layer_id = layer_id
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
@@ -105,21 +125,65 @@ class Qwen3Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        kv_cache: BaseKVCachePool,
+        out_loc: torch.Tensor,
+        attn_metadata: AttnMetadata,
     ) -> torch.Tensor:
-        batch, seq, _ = hidden_states.shape
+        # Flattened layout: hidden_states [total_tokens, hidden] — all the
+        # batch's tokens in one row-major stream; request boundaries live
+        # in attn_metadata.cu_seqlens_*.
+        total_tokens, _ = hidden_states.shape
         q, k, v = self.qkv_proj(hidden_states).split(
             [self.q_size, self.kv_size, self.kv_size], dim=-1
         )
-        # reshape to [batch, heads, seq, head_dim]; QK-Norm acts on head_dim
-        q = self.q_norm(q.view(batch, seq, self.num_heads, self.head_dim)).transpose(1, 2)
-        k = self.k_norm(k.view(batch, seq, self.num_kv_heads, self.head_dim)).transpose(1, 2)
-        v = v.view(batch, seq, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # reshape to [total_tokens, heads, head_dim]; QK-Norm acts on head_dim
+        q = self.q_norm(q.view(total_tokens, self.num_heads, self.head_dim))
+        k = self.k_norm(k.view(total_tokens, self.num_kv_heads, self.head_dim))
+        v = v.view(total_tokens, self.num_kv_heads, self.head_dim)
         cos, sin = self.rotary_emb(positions)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        # enable_gqa: k/v are repeated to q's head count automatically, no
-        # manual repeat_kv needed
-        o = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
-        return self.o_proj(o.transpose(1, 2).reshape(batch, seq, self.q_size))
+        # Store-then-read, mirroring mini-sglang's store_kv: this step's
+        # k/v land in the pool first, and attention reads the whole
+        # prefix (new tokens included) back from the pool.
+        kv_cache.write(k, v, out_loc, layer_id=self.layer_id)
+        o = self._attend(q, kv_cache, attn_metadata)
+        return self.o_proj(o.reshape(total_tokens, self.q_size))
+
+    def _attend(
+        self,
+        q: torch.Tensor,
+        kv_cache: BaseKVCachePool,
+        attn_metadata: AttnMetadata,
+    ) -> torch.Tensor:
+        """Per-request SDPA over pool-gathered KV; q is
+        [total_tokens, num_heads, head_dim], returns the same layout."""
+        outputs = []
+        for i in range(attn_metadata.size):
+            q_len = int(attn_metadata.cu_seqlens_q[i + 1] - attn_metadata.cu_seqlens_q[i])
+            k_len = int(attn_metadata.cache_seqlens[i])
+            # [1, heads, q_len/k_len, head_dim] for SDPA
+            q_i = q[attn_metadata.cu_seqlens_q[i] : attn_metadata.cu_seqlens_q[i + 1]]
+            q_i = q_i.transpose(0, 1).unsqueeze(0)
+            locs = attn_metadata.page_table[i, :k_len]
+            k_i, v_i = kv_cache.read(locs, layer_id=self.layer_id)
+            k_i = k_i.transpose(0, 1).unsqueeze(0)
+            v_i = v_i.transpose(0, 1).unsqueeze(0)
+            # is_causal assumes q and k start at the same position, which
+            # holds exactly when this request forwards its whole sequence
+            # now (prefill without a cached prefix); a single-token q
+            # (decode) needs no mask. Chunked extend (q_len < k_len,
+            # q_len > 1) requires an offset mask — arrives with ChunkedReq.
+            assert q_len == k_len or q_len == 1, (
+                f"unsupported extend shape: q_len={q_len}, k_len={k_len} "
+                "(chunked prefill not implemented yet)"
+            )
+            # enable_gqa: k/v are repeated to q's head count automatically,
+            # no manual repeat_kv needed
+            o_i = F.scaled_dot_product_attention(
+                q_i, k_i, v_i, is_causal=q_len > 1, enable_gqa=True
+            )
+            outputs.append(o_i.transpose(1, 2).squeeze(0))
+        return torch.cat(outputs, dim=0)
 
 
 class Qwen3MLP(nn.Module):
@@ -145,9 +209,9 @@ class Qwen3DecoderLayer(nn.Module):
     """pre-norm; the residual stream is threaded implicitly through
     RMSNorm's add_rms_forward (verbatim from nano-vllm)."""
 
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3Config, layer_id: int):
         super().__init__()
-        self.self_attn = Qwen3Attention(config)
+        self.self_attn = Qwen3Attention(config, layer_id)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -157,13 +221,18 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
+        kv_cache: BaseKVCachePool,
+        out_loc: torch.Tensor,
+        attn_metadata: AttnMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = self.self_attn(
+            positions, hidden_states, kv_cache, out_loc, attn_metadata
+        )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -175,7 +244,7 @@ class Qwen3Model(nn.Module):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
-            Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)
+            Qwen3DecoderLayer(config, layer_id) for layer_id in range(config.num_hidden_layers)
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -183,11 +252,18 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        kv_cache: BaseKVCachePool,
+        out_loc: torch.Tensor,
+        attn_metadata: AttnMetadata,
     ) -> torch.Tensor:
+        """input_ids/positions: flattened [total_tokens] across the whole
+        batch; per-request structure lives in attn_metadata."""
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
+            hidden_states, residual = layer(
+                positions, hidden_states, residual, kv_cache, out_loc, attn_metadata
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -230,8 +306,11 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        kv_cache: BaseKVCachePool,
+        out_loc: torch.Tensor,
+        attn_metadata: AttnMetadata,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        return self.model(input_ids, positions, kv_cache, out_loc, attn_metadata)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

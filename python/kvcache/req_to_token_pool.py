@@ -19,8 +19,8 @@ Intentional simplifications vs. sglang:
   graphs (AGENT.md deviation 4);
 - No memory-saver adapter, no mamba state slots, no req_generation —
   CPU-only, single model architecture;
-- `alloc()` takes no Req objects: Req has no `table_idx` field until R4,
-  so the pool just hands out a row index and the caller records it.
+- `alloc()` takes no Req objects: the pool just hands out a row index
+  and the caller (CacheManager) records it on `Req.table_idx`.
 """
 
 from __future__ import annotations
